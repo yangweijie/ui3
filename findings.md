@@ -1,25 +1,31 @@
-# Findings
+# Findings & Decisions
 
-## 参考项目 native（/Volumes/data/git/web/native）
-- Zig 写的跨平台 GUI SDK，Elm 架构：Model / Msg / update / view。
-- 跨平台后端：macOS(Cocoa/Metal)、Linux(X11/软件渲染)、Windows(Win32)、NullPlatform(无头, CI 用)。
-- automation server：快照、控件驱动、record/replay、确定性截图。
-- 关键文件：`examples/hello/src/main.zig`（App 结构）、`examples/hello/src/runner.zig`（按平台分派 runMacos/runLinux/runWindows/runNull）。
+## Requirements
+- 按对比(`web/native` vs `ui3`)的十个缺失方向补齐，排除移动端。
+- 每层：DSL(`Ui.php`) → 渲染(`Canvas.php`/`Layout.php`) → 自动化可见(`Snapshot`/`McpServer`)。
 
-## 工具链（本机）
-- PHP 8.5.7，composer 可用，zig 可用，clang(llvm@16) 可用，macOS arm64。
-- GUI 在 CI 无显示器无法验证渲染，因此必须有无头后端用于测试。
+## Research Findings (来自对比探索)
+- ui3 后端：`Backends/Canvas.php` 经 FFI 调 `ext/` 的 `libui3` C shim(`ui3_host_*`) 起原生窗口，Cairo 全树绘制。
+- `App.php`：Elm 式 `dispatch` → `backend->update($render())` 整树重渲染；事件循环 `while($backend->step()) { $server->poll(); }`。
+- `Canvas/Layout.php`：固定常量手写布局(PAD=12,ROW=32…)，仅 column/row/stack/split/list + 4 region(titlebar/toolbar/sidebar/statusbar)，无 flex/grid/绝对定位/虚拟化。
+- `Element.php`：`readonly type/props/children`，`prop()` 取值。
+- native 对照能力(已记录于对话)：组件含 grid/table/scroll_view/accordion/tabs/dialog/chart/tree…，布局为约束式 flexbox，渲染为 GPU canvas + design tokens，状态有 `canvas_widget_reconcile` 细粒度 diff，动画有 ticker/transition，事件含手势/滚轮/focus 遍历，a11y 有 role，自动化有 snapshot，多窗口有 window_state，另有 extensions/security/assets/embed/js-bridge。
 
-## phpc API（vendor/kingbes/phpc）
-- `Library::permit('libui3')` 后才能 `Library::load('libui3', $header)`（`FFI::cdef`）。
-- 所有 C 调用走 `SafeCall::invoke($ffi, $func, $args)`；非空指针用 `expectNotNull`；返回 0 用 `expectZero`。
-- 闭包→C 函数指针：`Phpc::callback($ffi, $closure, 'void(*)(void*)')` 返回对象，`->raw()` 取指针。
-- `Phpc::wrap`/CData 做 RAII；`Pointer::isNull` 判断空指针。
+## Technical Decisions
+- 主题：新增 `src/Theme.php`，`App` 持有当前 theme，`Canvas` 从 theme 解析颜色；`Element` 可带 `style` 覆盖。
+- 自定义绘制：`Ui::canvas(callable)` → 'custom' 元素，`drawNode` 调用闭包(cairo ctx+rect)。闭包不跨进程序列化，自动化快照仅取元信息。
+- 布局增强：在 `Layout` 增加 grow/shrink、grid、positioned(绝对) 分支；虚拟化先做窗口化列表雏形。
+- 动画：复用 `App::run` 事件循环推进 `now`；元素带 `animate` 描述，Canvas 在 paint 时按 `now` 插值。
+- 多窗口：`App` 增加 `Window` 集合(windows State)，新增 `WindowManager`；headless 下可枚举/聚焦。
+- Web：`Backends/Html.php` 将 Element 树渲染为 HTML+内联 JS(事件经 POST 回 PHP 同 DSL)。
 
-## 设计决策
-- C ABI：`ui3_app_create/destroy`, `ui3_label_create`, `ui3_button_create`, `ui3_widget_set_text`, `ui3_button_on_click(btn, cb, userdata)`, `ui3_app_set_root`, `ui3_app_run`, `ui3_app_step`, `ui3_app_quit`, `ui3_set_backend("auto"|"null")`。
-- Elm 运行时 `App`：`model`/`update`/`view`，`dispatch(msg)` 更新 model 并 `update()` 推给后端；`render()` 返回视图树（可单测）。
-- 后端接口 `Backend`：`mount(tree, dispatch)`, `update(tree)`, `run()`, `quit()`。
-  - `NativeBackend`：FFI 调用 libui3；按钮点击经 C→PHP 闭包调 dispatch。
-  - `HeadlessBackend`：纯 PHP，记录挂载/文本/派发，可模拟点击——让 Pest 逻辑测试不依赖 C 构建。
-- 无头后端（C null）也供 FFI 冒烟测试使用，避免打开真实窗口。
+## Issues Encountered
+| Issue | Resolution |
+|-------|------------|
+| 测试需在已构建 libui3 的环境运行，CI 无构建时 Canvas 测试会崩 | `bin/run.sh` 缺失 `libui3` 时自动 `ext/build.sh`；`UI3_SKIP_BUILD=1` 可跳过（CI 独立构建步骤） |
+| 原生窗口阻塞，无头环境无法跑 GUI 测试 | 示例默认 headless；`UI3_REAL_WINDOW=1` 才开真实窗口；`web_target`/`systems` 为纯 PHP 无需原生库 |
+| (待填充) | |
+
+## Resources
+- ui3: /Volumes/data/git/php/ui3/src/{Ui,App,Element,Backends/Canvas,Canvas/Layout,Canvas/Node,Automation,System}
+- native: /Volumes/data/git/web/native/src/{primitives, runtime, platform, automation, window_state, extensions, security, assets, js, bridge}

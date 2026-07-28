@@ -39,6 +39,9 @@ cairo_surface_t* cairo_image_surface_create(int format, int width, int height);
 cairo_t* cairo_create(cairo_surface_t* surface);
 void cairo_destroy(cairo_t* cr);
 void cairo_surface_destroy(cairo_surface_t* surface);
+void cairo_push_group(cairo_t* cr);
+void cairo_pop_group_to_source(cairo_t* cr);
+void cairo_paint_with_alpha(cairo_t* cr, double alpha);
 C;
 
     public static function ffi(): FFI
@@ -145,6 +148,21 @@ C;
             'w' => (float) $ext->x_advance,
             'h' => $ext->height > 0 ? (float) $ext->height : (float) $size * 1.2,
         ];
+    }
+
+    public static function pushGroup($cr): void
+    {
+        self::ffi()->cairo_push_group($cr);
+    }
+
+    public static function popGroupToSource($cr): void
+    {
+        self::ffi()->cairo_pop_group_to_source($cr);
+    }
+
+    public static function paintWithAlpha($cr, float $alpha): void
+    {
+        self::ffi()->cairo_paint_with_alpha($cr, $alpha);
     }
 
     private static function measureCr(): ?FFI\CData

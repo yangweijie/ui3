@@ -29,7 +29,7 @@ final class Snapshot
      * @param list<Node> $nodes Real laid-out nodes; when given, bounds come from them.
      * @return array{title:string,width:int,height:int,widgets:list<array<string,mixed>>}
      */
-    public static function capture(Element $root, int $width = 320, int $height = 240, array $nodes = []): array
+    public static function capture(Element $root, int $width = 320, int $height = 240, array $nodes = [], ?string $focusId = null): array
     {
         $title = (string) $root->prop('title', 'App');
         $width = (int) $root->prop('width', $width);
@@ -47,7 +47,7 @@ final class Snapshot
         }
 
         $widgets = [];
-        self::collect($root, null, $widgets, $boxes);
+        self::collect($root, null, $widgets, $boxes, $focusId);
 
         return ['title' => $title, 'width' => $width, 'height' => $height, 'widgets' => $widgets];
     }
@@ -129,14 +129,15 @@ final class Snapshot
      * @param list<array<string,mixed>> $widgets
      * @param array<int,array{x:int,y:int,w:int,h:int}> $boxes
      */
-    private static function collect(Element $el, ?string $parentId, array &$widgets, array $boxes): void
+    private static function collect(Element $el, ?string $parentId, array &$widgets, array $boxes, ?string $focusId = null): void
     {
         $idKey = $el->prop('id');
         $key = is_string($idKey) ? $idKey : spl_object_id($el);
         $b = $boxes[$key] ?? ['x' => 0, 'y' => 0, 'w' => 0, 'h' => 0];
         $id = $el->prop('id');
         $id = is_string($id) ? $id : null;
-        $role = $el->type;
+        // Semantic role: an explicit a11y role overrides the widget type.
+        $role = $el->prop('role') ?? $el->type;
         $name = match ($role) {
             'window' => (string) $el->prop('title', ''),
             'label', 'button', 'toggle', 'iconbutton' => (string) $el->prop('text', ''),
@@ -144,13 +145,21 @@ final class Snapshot
             'list_item' => (string) $el->prop('title', ''),
             'webview' => (string) $el->prop('url', ''),
             'gpusurface' => 'gpu:' . $el->prop('width', 0) . 'x' . $el->prop('height', 0),
-            default => '',
+            default => (string) ($el->prop('text') ?? $el->prop('title') ?? ''),
         };
+        // Accessible name: an explicit label overrides the derived name.
+        $label = $el->prop('label');
+        if (is_string($label)) {
+            $name = $label;
+        }
 
         $entry = [
             'id' => $id,
             'role' => $role,
             'name' => $name,
+            'label' => $label,
+            'description' => $el->prop('description'),
+            'focused' => $focusId !== null && $id !== null && $id === $focusId,
             'enabled' => true,
             'parent_id' => $parentId,
             'x' => $b['x'], 'y' => $b['y'], 'w' => $b['w'], 'h' => $b['h'],
@@ -210,7 +219,7 @@ final class Snapshot
 
         $childParent = $id ?? $parentId;
         foreach ($el->children as $c) {
-            self::collect($c, $childParent, $widgets, $boxes);
+            self::collect($c, $childParent, $widgets, $boxes, $focusId);
         }
     }
 }

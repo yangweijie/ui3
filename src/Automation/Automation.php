@@ -47,7 +47,14 @@ final class Automation
         if (!$root) {
             throw new \RuntimeException('automation not started: call start() first');
         }
-        return Snapshot::capture($root, (int) $root->prop('width', 320), (int) $root->prop('height', 240), $this->backend->layout());
+        $focusId = method_exists($this->backend, 'focusedId') ? $this->backend->focusedId() : null;
+        return Snapshot::capture(
+            $root,
+            (int) $root->prop('width', 320),
+            (int) $root->prop('height', 240),
+            $this->backend->layout(),
+            $focusId,
+        );
     }
 
     /**

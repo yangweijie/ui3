@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace Yangweijie\Ui3;
 
 use Yangweijie\Ui3\Automation\Automation;
+use Yangweijie\Ui3\Extensions;
 use Yangweijie\Ui3\System\AutomationServer;
+use Yangweijie\Ui3\Windows;
 
 /**
  * Elm-style application runtime (mirrors native's Model / Msg / update / view).
@@ -25,6 +27,15 @@ final class App
     private bool $automationMcp = true;
     private ?AutomationServer $automationServer = null;
 
+    /** Active design tokens (Theme name or raw token array), applied to the backend on run(). */
+    private mixed $theme = null;
+
+    /** Multi-window state (open/close/focus), mirrors native's window_state. */
+    private Windows $windows;
+
+    /** Extension hook bus (mirrors native's extensions/). */
+    private Extensions $extensions;
+
     /**
      * @param mixed    $init   initial model, or a callable () => model
      * @param \Closure $update (model, msg) => model
@@ -34,7 +45,10 @@ final class App
         private mixed $init,
         private \Closure $update,
         private \Closure $view,
-    ) {}
+    ) {
+        $this->windows = new Windows();
+        $this->extensions = new Extensions();
+    }
 
     /**
      * Enable the embedded automation server (REST + MCP) once run() starts, so an
@@ -47,6 +61,17 @@ final class App
         $this->automationEnabled = true;
         $this->automationPort = $port;
         $this->automationMcp = $mcp;
+        return $this;
+    }
+
+    /**
+     * Apply a design theme to the running window. Accepts a Theme name
+     * (Theme::LIGHT / Theme::DARK) or a raw token array. The backend resolves
+     * it into concrete colors/fonts on every paint.
+     */
+    public function withTheme(string|array $theme): self
+    {
+        $this->theme = $theme;
         return $this;
     }
 
@@ -72,6 +97,7 @@ final class App
         if ($this->backend) {
             $this->backend->update($this->render());
         }
+        $this->extensions->trigger('afterUpdate', $this->model);
         if ($this->automationServer !== null) {
             $this->automationServer->notifyStateChanged();
         }
@@ -80,7 +106,52 @@ final class App
 
     public function render(): Element
     {
-        return ($this->view)($this->model);
+        $this->extensions->trigger('beforeRender', $this->model);
+        $el = ($this->view)($this->model);
+        $this->extensions->trigger('afterRender', $el);
+        return $el;
+    }
+
+    /** Register an extension hook at a lifecycle point (beforeRender/afterRender/afterUpdate). */
+    public function extend(string $point, callable $hook): self
+    {
+        $this->extensions->register($point, $hook);
+        return $this;
+    }
+
+    public function extensions(): Extensions
+    {
+        return $this->extensions;
+    }
+
+    /** Open an additional window (registered in window state); renders on a real host. */
+    public function openWindow(string $id, string $title, int $width = 320, int $height = 240): self
+    {
+        $this->windows->open($id, $title, $width, $height);
+        return $this;
+    }
+
+    public function closeWindow(string $id): self
+    {
+        $this->windows->close($id);
+        return $this;
+    }
+
+    public function focusWindow(string $id): self
+    {
+        $this->windows->focus($id);
+        return $this;
+    }
+
+    /** The window-state manager. */
+    public function windows(): Windows
+    {
+        return $this->windows;
+    }
+
+    public function activeWindow(): ?string
+    {
+        return $this->windows->active();
     }
 
     public function run(?Backend $backend = null): void
@@ -88,6 +159,9 @@ final class App
         $backend ??= new Backends\Canvas();
         $this->start();
         $this->backend = $backend;
+        if ($this->theme !== null && method_exists($backend, 'setTheme')) {
+            $backend->setTheme($this->theme);
+        }
         $backend->mount($this->render(), fn(string $msg, mixed $payload = null) => $this->dispatch($msg, $payload));
 
         if ($this->automationEnabled && !$backend->isHeadless()) {

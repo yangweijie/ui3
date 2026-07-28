@@ -4,11 +4,13 @@ declare(strict_types=1);
 namespace Yangweijie\Ui3\Backends;
 
 use Kingbes\Phpc\Phpc;
+use Yangweijie\Ui3\Animation;
 use Yangweijie\Ui3\Backend;
 use Yangweijie\Ui3\Canvas\Layout;
 use Yangweijie\Ui3\Canvas\Node;
 use Yangweijie\Ui3\Element;
 use Yangweijie\Ui3\FFI\{Cairo, LibUi3};
+use Yangweijie\Ui3\Theme;
 
 /**
  * Canvas backend (libui-free). Owns a native window host via libui3 and paints
@@ -41,6 +43,22 @@ final class Canvas implements Backend
     private ?array $drag = null;
     /** Count of frames actually painted (real-window draw path proof). */
     private int $framesDrawn = 0;
+    /** Active design tokens (colors/fonts/radius), resolved from a Theme. */
+    private array $theme = [];
+    /** Animation clock in seconds. Real windows use wall-clock; tests freeze it. */
+    private float $clock = 0.0;
+    /** When true, `clock` comes from setTime() instead of microtime(). */
+    private bool $manualClock = false;
+    /** @var ?float absolute time used while $manualClock is true */
+    private ?float $clockOverride = null;
+    /** @var array<string,float> element id => animation start time (seconds) */
+    private array $animStart = [];
+    /** @var array<string,array{alpha:float,dx:float,dy:float,scale:float,done:bool}> */
+    private array $animStates = [];
+    /** Per-id scroll offset overrides (programmatic wheel/scroll). int by id. */
+    private array $scrollOverrides = [];
+    /** Open context menus keyed by element id => item list. */
+    private array $contextMenus = [];
 
     private const POINTER_DOWN = 1;
     private const POINTER_UP = 2;
@@ -59,10 +77,181 @@ final class Canvas implements Backend
     public function __construct(private bool $headless = false)
     {
         $this->ffi = LibUi3::ffi();
+        $this->theme = Theme::get(Theme::LIGHT);
+    }
+
+    /**
+     * Switch the active design tokens. Accepts a Theme name (Theme::LIGHT /
+     * Theme::DARK) or a raw token array. Drives all subsequent paints.
+     */
+    public function setTheme(string|array $theme): void
+    {
+        $this->theme = Theme::get($theme);
+    }
+
+    /** Current resolved tokens (for tests / automation introspection). */
+    public function theme(): array
+    {
+        return $this->theme;
+    }
+
+    /** Resolve a color token to a [r,g,b] triple (0..1), falling back to black. */
+    public function col(string $name): array
+    {
+        return $this->theme[$name] ?? [0.0, 0.0, 0.0];
+    }
+
+    /** Resolve a non-color token (radius/font/fontSize), with a default. */
+    public function tkn(string $name, mixed $default = null): mixed
+    {
+        return $this->theme[$name] ?? $default;
+    }
+
+    // ---- animation: a clock-driven ticker + per-element interpolation ----
+
+    /** Freeze the animation clock at t=0 so a test can advance it deterministically. */
+    public function freezeClock(): void
+    {
+        $this->manualClock = true;
+        $this->clockOverride = 0.0;
+    }
+
+    /** Set the absolute animation clock (seconds). Only meaningful after freezeClock(). */
+    public function setTime(float $seconds): void
+    {
+        $this->clockOverride = $seconds;
+    }
+
+    /** Current clock value (seconds). */
+    public function clock(): float
+    {
+        return $this->clock;
+    }
+
+    /**
+     * Computed animation state for an element id, populated on the last paint:
+     * ['alpha'=>float, 'dx'=>float, 'dy'=>float, 'scale'=>float, 'done'=>bool].
+     */
+    public function animState(string $id): ?array
+    {
+        return $this->animStates[$id] ?? null;
+    }
+
+    /** True while at least one element still has an in-flight animation. */
+    public function isAnimating(): bool
+    {
+        foreach ($this->animStates as $s) {
+            if (!$s['done']) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Ask the native host to repaint (real windows only). */
+    public function requestRedraw(): void
+    {
+        if ($this->host) {
+            Phpc::call($this->ffi, 'ui3_host_request_redraw', [$this->host]);
+        }
+    }
+
+    // ---- input: keyboard focus, scroll, context menu, gestures ----
+
+    /** Advance focus forward (Tab). */
+    public function tabForward(): void
+    {
+        $this->moveFocus(1);
+    }
+
+    /** Move focus backward (Shift+Tab). */
+    public function tabBackward(): void
+    {
+        $this->moveFocus(-1);
+    }
+
+    /** Programmatically scroll a list/scroll widget by $delta rows/pixels. */
+    public function scrollBy(string $id, int $delta): void
+    {
+        $node = $this->findNodeById($id);
+        if ($node === null) {
+            return;
+        }
+        $cur = (int) $node->el->prop('scroll', $node->el->prop('offset', 0));
+        $next = max(0, $cur + $delta);
+        $this->scrollOverrides[$id] = $next;
+        $msg = $node->el->prop('onScroll');
+        if (is_string($msg) && $msg !== '') {
+            ($this->dispatch)($msg, $next);
+        }
+        if ($this->host) {
+            Phpc::call($this->ffi, 'ui3_host_request_redraw', [$this->host]);
+        }
+    }
+
+    /** Current scroll offset for a list/scroll widget. */
+    public function scrollOffset(string $id): int
+    {
+        if (isset($this->scrollOverrides[$id])) {
+            return (int) $this->scrollOverrides[$id];
+        }
+        $node = $this->findNodeById($id);
+        return $node ? (int) $node->el->prop('scroll', $node->el->prop('offset', 0)) : 0;
+    }
+
+    /** Open the context menu attached to an element (right-click equivalent). */
+    public function openContextMenu(string $id): void
+    {
+        $node = $this->findNodeById($id);
+        if ($node === null) {
+            return;
+        }
+        $items = $node->el->prop('contextMenu');
+        if (is_array($items) && $items !== []) {
+            $this->contextMenus[$id] = $items;
+            if ($this->host) {
+                Phpc::call($this->ffi, 'ui3_host_request_redraw', [$this->host]);
+            }
+        }
+    }
+
+    /** Close every open context menu. */
+    public function closeContextMenus(): void
+    {
+        $this->contextMenus = [];
+    }
+
+    public function isContextMenuOpen(string $id): bool
+    {
+        return isset($this->contextMenus[$id]);
+    }
+
+    /** Items of an open context menu (empty if none). */
+    public function contextMenuItems(string $id): array
+    {
+        return $this->contextMenus[$id] ?? [];
+    }
+
+    /** Dispatch a gesture (e.g. 'swipe') recognized on an element. */
+    public function dispatchGesture(string $id, string $type): void
+    {
+        $node = $this->findNodeById($id);
+        if ($node === null) {
+            return;
+        }
+        if (($node->el->prop('gesture') ?? '') !== $type) {
+            return;
+        }
+        $msg = $node->el->prop('onGesture');
+        if (is_string($msg) && $msg !== '') {
+            ($this->dispatch)($msg, $type);
+        }
     }
 
     public function mount(Element $root, \Closure $dispatch): void
     {
+        $this->animStart = [];
+        $this->animStates = [];
         $this->root = $root;
         $this->dispatch = $dispatch;
 
@@ -95,6 +284,8 @@ final class Canvas implements Backend
 
     public function update(Element $root): void
     {
+        $this->animStart = [];
+        $this->animStates = [];
         $this->root = $root;
         $this->layout = Layout::compute($root);
         if ($this->host) {
@@ -260,16 +451,22 @@ final class Canvas implements Backend
         // The host hands back its cairo_t* as a void* (cross-FFI scope); bridge
         // it into the Cairo wrapper's scope so its struct type matches.
         $cr = Cairo::ffi()->cast('cairo_t*', $cr);
+        // Advance the animation clock (wall-clock for real windows, frozen for tests).
+        $this->clock = $this->manualClock ? (float)($this->clockOverride ?? 0.0) : microtime(true);
         $this->framesDrawn++;
         $w = $this->root ? (int) $this->root->prop('width', 320) : 320;
         $h = $this->root ? (int) $this->root->prop('height', 240) : 240;
-        Cairo::fillRect($cr, 0, 0, $w, $h, 1, 1, 1);
+        Cairo::fillRect($cr, 0, 0, $w, $h, ...$this->col('bg'));
         if (!$this->root) {
             return;
         }
-        $this->layout = Layout::compute($this->root);
+        $this->layout = Layout::compute($this->root, $this->scrollOverrides);
         foreach ($this->layout as $n) {
             $this->drawNode($cr, $n);
+        }
+        // Keep the native frame loop alive while animations are still in flight.
+        if ($this->host && $this->isAnimating()) {
+            Phpc::call($this->ffi, 'ui3_host_request_redraw', [$this->host]);
         }
     }
 
@@ -589,72 +786,123 @@ final class Canvas implements Backend
         $x = $n->x; $y = $n->y; $w = $n->w; $h = $n->h;
         $f = Cairo::ffi();
 
+        // ----- animation: interpolate translate / scale / opacity from the clock -----
+        $dx = 0; $dy = 0; $scale = 1.0; $alpha = 1.0;
+        $anim = $el->prop('anim');
+        if (is_array($anim) && $anim !== []) {
+            $aid = (string)($el->prop('id') ?? spl_object_id($el));
+            if (!isset($this->animStart[$aid])) {
+                $this->animStart[$aid] = $this->clock;
+            }
+            $elapsed = ($this->clock - $this->animStart[$aid]) * 1000.0;
+            $allDone = true;
+            foreach ($anim as $spec) {
+                $dur = (float)($spec['duration'] ?? 1000);
+                $delay = (float)($spec['delay'] ?? 0);
+                $p = Animation::progress($elapsed, $dur, $delay);
+                if ($p < 1.0) {
+                    $allDone = false;
+                }
+                $e = Animation::ease((string)($spec['easing'] ?? 'linear'), $p);
+                $from = (float)($spec['from'] ?? 0);
+                $to = (float)($spec['to'] ?? 1);
+                $v = $from + ($to - $from) * $e;
+                switch ($spec['key'] ?? 'opacity') {
+                    case 'x':
+                        $dx = $v;
+                        break;
+                    case 'y':
+                        $dy = $v;
+                        break;
+                    case 'scale':
+                        $scale = $v;
+                        break;
+                    default:
+                        $alpha = $v;
+                }
+            }
+            $x = (int)($x + $dx);
+            $y = (int)($y + $dy);
+            $w = (int)max(1, $w * $scale);
+            $h = (int)max(1, $h * $scale);
+            $this->animStates[$aid] = [
+                'alpha' => $alpha, 'dx' => $dx, 'dy' => $dy, 'scale' => $scale, 'done' => $allDone,
+            ];
+        }
+
+        // Opacity is applied to the whole element subtree via a cairo group.
+        $grouped = $alpha < 0.999;
+        if ($grouped) {
+            Cairo::pushGroup($cr);
+        }
+
         switch ($t) {
             case 'panel':
-                Cairo::fillRect($cr, $x, $y, $w, $h, 0.96, 0.96, 0.98);
-                Cairo::strokeRect($cr, $x, $y, $w, $h, 0.7, 0.7, 0.75);
-                Cairo::text($cr, $x + 8, $y + 18, (string) $el->prop('title', ''), 13, 0.2, 0.2, 0.2);
+                Cairo::fillRect($cr, $x, $y, $w, $h, ...$this->col('surface'));
+                Cairo::strokeRect($cr, $x, $y, $w, $h, ...$this->col('border'));
+                Cairo::text($cr, $x + 8, $y + 18, (string) $el->prop('title', ''), 13, ...$this->col('text'));
                 break;
             case 'label':
-                Cairo::text($cr, $x, $y + 13, (string) $el->prop('text', ''), 13, 0.1, 0.1, 0.1);
+                Cairo::text($cr, $x, $y + 13, (string) $el->prop('text', ''), 13, ...$this->col('text'));
                 break;
             case 'heading':
-                Cairo::text($cr, $x, $y + 18, (string) $el->prop('text', ''), 18, 0, 0, 0);
+                Cairo::text($cr, $x, $y + 18, (string) $el->prop('text', ''), 18, ...$this->col('text'));
                 break;
             case 'button':
-                Cairo::fillRect($cr, $x, $y, $w, $h, 0.93, 0.93, 0.95);
-                Cairo::strokeRect($cr, $x, $y, $w, $h, 0.6, 0.6, 0.65);
+                Cairo::fillRect($cr, $x, $y, $w, $h, ...$this->col('surface'));
+                Cairo::strokeRect($cr, $x, $y, $w, $h, ...$this->col('border'));
                 $txt = (string) $el->prop('text', '');
                 $e = Cairo::textExtents($cr, $txt);
-                Cairo::text($cr, $x + ($w - $e['w']) / 2, $y + $h / 2 + 4, $txt, 13, 0.1, 0.1, 0.1);
+                Cairo::text($cr, $x + ($w - $e['w']) / 2, $y + $h / 2 + 4, $txt, 13, ...$this->col('text'));
                 break;
             case 'input':
             case 'textarea':
-                Cairo::fillRect($cr, $x, $y, $w, $h, 1, 1, 1);
-                Cairo::strokeRect($cr, $x, $y, $w, $h, 0.7, 0.7, 0.75);
+                Cairo::fillRect($cr, $x, $y, $w, $h, ...$this->col('surface'));
+                Cairo::strokeRect($cr, $x, $y, $w, $h, ...$this->col('border'));
                 $show = $this->displayTextFor($n);
-                $c = $show !== '' && $show !== (string) $el->prop('placeholder', '') ? 0.1 : 0.5;
-                Cairo::text($cr, $x + 6, $y + 16, $show, 13, $c, $c, $c);
+                $tc = $show !== '' && $show !== (string) $el->prop('placeholder', '')
+                    ? $this->col('text') : $this->col('textMuted');
+                Cairo::text($cr, $x + 6, $y + 16, $show, 13, ...$tc);
                 break;
             case 'checkbox':
             case 'radio':
-                Cairo::strokeRect($cr, $x, $y + 2, 14, 14, 0.5, 0.5, 0.55);
+                Cairo::strokeRect($cr, $x, $y + 2, 14, 14, ...$this->col('border'));
                 if ($el->prop('checked')) {
-                    Cairo::fillRect($cr, $x + 3, $y + 5, 8, 8, 0.2, 0.4, 0.9);
+                    Cairo::fillRect($cr, $x + 3, $y + 5, 8, 8, ...$this->col('accent'));
                 }
-                Cairo::text($cr, $x + 20, $y + 13, (string) $el->prop('text', ''), 13, 0.1, 0.1, 0.1);
+                Cairo::text($cr, $x + 20, $y + 13, (string) $el->prop('text', ''), 13, ...$this->col('text'));
                 break;
             case 'slider':
-                Cairo::strokeRect($cr, $x, $y + 8, $w, 8, 0.8, 0.8, 0.82);
+                Cairo::strokeRect($cr, $x, $y + 8, $w, 8, ...$this->col('border'));
                 $min = (int) $el->prop('min', 0);
                 $max = (int) $el->prop('max', 100);
                 $val = (int) $el->prop('value', 0);
                 $frac = $max > $min ? ($val - $min) / ($max - $min) : 0;
-                Cairo::fillRect($cr, $x + $frac * ($w - 8), $y + 4, 8, 16, 0.2, 0.4, 0.9);
+                Cairo::fillRect($cr, $x + $frac * ($w - 8), $y + 4, 8, 16, ...$this->col('accent'));
                 break;
             case 'progress':
-                Cairo::strokeRect($cr, $x, $y, $w, $h, 0.8, 0.8, 0.82);
+                Cairo::strokeRect($cr, $x, $y, $w, $h, ...$this->col('border'));
                 $val = (float) $el->prop('value', 0);
                 $frac = $val > 1 ? $val / 100 : $val;
-                Cairo::fillRect($cr, $x, $y, (int) ($w * $frac), $h, 0.2, 0.6, 0.3);
+                Cairo::fillRect($cr, $x, $y, (int) ($w * $frac), $h, ...$this->col('accent'));
                 break;
             case 'select':
-                Cairo::fillRect($cr, $x, $y, $w, $h, 1, 1, 1);
-                Cairo::strokeRect($cr, $x, $y, $w, $h, 0.7, 0.7, 0.75);
+                Cairo::fillRect($cr, $x, $y, $w, $h, ...$this->col('surface'));
+                Cairo::strokeRect($cr, $x, $y, $w, $h, ...$this->col('border'));
                 $opts = $el->prop('options', []);
                 $sel = (int) $el->prop('value', 0);
                 $txt = $opts[$sel] ?? '';
-                Cairo::text($cr, $x + 6, $y + 16, (string) $txt, 13, 0.1, 0.1, 0.1);
+                Cairo::text($cr, $x + 6, $y + 16, (string) $txt, 13, ...$this->col('text'));
                 if (!empty($this->expanded[(string) ($el->prop('id') ?? '')])) {
                     $popTop = $y + $h;
                     foreach ($opts as $i => $o) {
                         $oy = $popTop + $i * 20;
-                        Cairo::fillRect($cr, $x, $oy, $w, 20, 1, 1, 1);
-                        Cairo::strokeRect($cr, $x, $oy, $w, 20, 0.7, 0.7, 0.75);
+                        Cairo::fillRect($cr, $x, $oy, $w, 20, ...$this->col('surface'));
+                        Cairo::strokeRect($cr, $x, $oy, $w, 20, ...$this->col('border'));
                         if ($i === $sel) {
-                            Cairo::fillRect($cr, $x, $oy, $w, 20, 0.85, 0.9, 0.98);
+                            Cairo::fillRect($cr, $x, $oy, $w, 20, ...$this->col('selected'));
                         }
-                        Cairo::text($cr, $x + 6, $oy + 14, (string) $o, 13, 0.1, 0.1, 0.1);
+                        Cairo::text($cr, $x + 6, $oy + 14, (string) $o, 13, ...$this->col('text'));
                     }
                 }
                 break;
@@ -663,18 +911,18 @@ final class Canvas implements Backend
                 if ($items === []) {
                     break; // rows (list_item) are drawn by their own nodes
                 }
-                Cairo::fillRect($cr, $x, $y, $w, $h, 1, 1, 1);
-                Cairo::strokeRect($cr, $x, $y, $w, $h, 0.7, 0.7, 0.75);
+                Cairo::fillRect($cr, $x, $y, $w, $h, ...$this->col('surface'));
+                Cairo::strokeRect($cr, $x, $y, $w, $h, ...$this->col('border'));
                 $sel = (int) $el->prop('value', -1);
                 $hl = $this->highlights[(string) ($el->prop('id') ?? '')] ?? -1;
                 foreach ($items as $i => $it) {
                     $iy = $y + 4 + $i * 20;
                     if ($i === $sel) {
-                        Cairo::fillRect($cr, $x, $iy, $w, 20, 0.85, 0.9, 0.98);
+                        Cairo::fillRect($cr, $x, $iy, $w, 20, ...$this->col('selected'));
                     } elseif ($i === $hl) {
-                        Cairo::strokeRect($cr, $x + 1, $iy + 1, $w - 2, 18, 0.2, 0.4, 0.9, 2.0);
+                        Cairo::strokeRect($cr, $x + 1, $iy + 1, $w - 2, 18, ...[...$this->col('accent'), 2.0]);
                     }
-                    Cairo::text($cr, $x + 6, $iy + 14, (string) $it, 13, 0.1, 0.1, 0.1);
+                    Cairo::text($cr, $x + 6, $iy + 14, (string) $it, 13, ...$this->col('text'));
                 }
                 break;
             case 'toggle':
@@ -701,6 +949,15 @@ final class Canvas implements Backend
             case 'gpusurface':
                 $this->drawPlaceholder($cr, $x, $y, $w, $h, 'GPU surface');
                 break;
+            case 'custom':
+                // App-supplied drawing callback: receives the cairo context, the
+                // element's screen rect, and this backend, so users can paint
+                // anything Cairo supports without a native widget.
+                $cb = $el->prop('draw');
+                if (is_callable($cb)) {
+                    $cb($cr, $x, $y, $w, $h, $this);
+                }
+                break;
             case 'toolbar':
             case 'statusbar':
             case 'titlebar':
@@ -708,17 +965,161 @@ final class Canvas implements Backend
                 $this->drawStrip($cr, $t, $x, $y, $w, $h);
                 break;
             case 'image':
-                Cairo::fillRect($cr, $x, $y, $w, $h, 0.9, 0.9, 0.92);
-                Cairo::strokeRect($cr, $x, $y, $w, $h, 0.7, 0.7, 0.75);
+                Cairo::fillRect($cr, $x, $y, $w, $h, ...$this->col('surface'));
+                Cairo::strokeRect($cr, $x, $y, $w, $h, ...$this->col('border'));
                 break;
             case 'divider':
-                Cairo::line($cr, $x, $y + 0.5, $x + $w, $y + 0.5, 0.7, 0.7, 0.75);
+                Cairo::line($cr, $x, $y + 0.5, $x + $w, $y + 0.5, ...$this->col('border'));
                 break;
             case 'window':
             case 'column':
             case 'row':
             case 'stack':
             case 'spacer':
+                break;
+
+            // ---- Phase 3 widgets ----
+            case 'tabs':
+            case 'accordion':
+            case 'scroll':
+            case 'menu':
+            case 'tree':
+            case 'button_group':
+                Cairo::strokeRect($cr, $x, $y, $w, $h, ...$this->col('border'));
+                break;
+            case 'tab':
+                Cairo::strokeRect($cr, $x, $y, $w, $h, ...$this->col('border'));
+                Cairo::text($cr, $x + 6, $y + 18, (string) $el->prop('title', ''), 12, ...$this->col('text'));
+                break;
+            case 'card':
+                Cairo::fillRect($cr, $x, $y, $w, $h, ...$this->col('surface'));
+                Cairo::strokeRect($cr, $x, $y, $w, $h, ...$this->col('border'));
+                Cairo::text($cr, $x + 8, $y + 18, (string) $el->prop('title', ''), 13, ...$this->col('text'));
+                break;
+            case 'alert':
+                $sev = (string) $el->prop('severity', 'info');
+                $accent = match ($sev) {
+                    'error' => [0.8, 0.2, 0.2],
+                    'warn' => [0.9, 0.6, 0.1],
+                    'success' => [0.2, 0.6, 0.3],
+                    default => $this->col('accent'),
+                };
+                Cairo::fillRect($cr, $x, $y, $w, $h, ...$this->col('surface'));
+                Cairo::strokeRect($cr, $x, $y, $w, $h, ...$accent);
+                Cairo::fillRect($cr, $x, $y, 4, $h, ...$accent);
+                Cairo::text($cr, $x + 10, $y + 16, (string) $el->prop('text', ''), 12, ...$this->col('text'));
+                break;
+            case 'dialog':
+            case 'sheet':
+            case 'drawer':
+                Cairo::fillRect($cr, $x, $y, $w, $h, ...$this->col('surface'));
+                Cairo::strokeRect($cr, $x, $y, $w, $h, ...$this->col('border'));
+                Cairo::text($cr, $x + 8, $y + 18, (string) $el->prop('title', ''), 13, ...$this->col('text'));
+                break;
+            case 'table':
+                Cairo::strokeRect($cr, $x, $y, $w, $h, ...$this->col('border'));
+                $cols = $el->prop('columns', []);
+                $rows = $el->prop('rows', []);
+                $nc = max(1, count($cols));
+                $ch = count($rows) > 0 ? (int) ($h / (count($rows) + 1)) : 20;
+                $cw = (int) ($w / $nc);
+                foreach ($cols as $i => $c) {
+                    Cairo::text($cr, $x + $i * $cw + 4, $y + 16, (string) $c, 11, ...$this->col('textMuted'));
+                }
+                foreach ($rows as $r => $row) {
+                    foreach ($row as $i => $cell) {
+                        Cairo::text($cr, $x + $i * $cw + 4, $y + 16 + ($r + 1) * $ch, (string) $cell, 11, ...$this->col('text'));
+                    }
+                }
+                break;
+            case 'combobox':
+            case 'dropdown':
+                Cairo::fillRect($cr, $x, $y, $w, $h, ...$this->col('surface'));
+                Cairo::strokeRect($cr, $x, $y, $w, $h, ...$this->col('border'));
+                $opts = $el->prop('options', []);
+                $sel = (int) $el->prop('value', 0);
+                Cairo::text($cr, $x + 6, $y + 16, (string) ($opts[$sel] ?? ($opts[0] ?? '')), 12, ...$this->col('text'));
+                break;
+            case 'menu_item':
+                Cairo::text($cr, $x + 6, $y + 16, (string) $el->prop('title', ''), 12, ...$this->col('text'));
+                break;
+            case 'tree_node':
+                Cairo::text($cr, $x + 6, $y + 16, (string) $el->prop('title', ''), 12, ...$this->col('text'));
+                break;
+            case 'acc_header':
+                Cairo::text($cr, $x + 6, $y + 18, (string) $el->prop('title', ''), 12, ...$this->col('text'));
+                break;
+            case 'chart':
+                Cairo::fillRect($cr, $x, $y, $w, $h, ...$this->col('surface'));
+                Cairo::strokeRect($cr, $x, $y, $w, $h, ...$this->col('border'));
+                $data = $el->prop('data', []);
+                $n = count($data);
+                if ($n > 0) {
+                    $max = 1;
+                    foreach ($data as $d) {
+                        $v = is_array($d) ? ((float) ($d[1] ?? 0)) : (float) $d;
+                        $max = max($max, $v);
+                    }
+                    $bw = $w / $n;
+                    foreach ($data as $i => $d) {
+                        $v = is_array($d) ? ((float) ($d[1] ?? 0)) : (float) $d;
+                        $bh = (int) ($h * $v / $max);
+                        Cairo::fillRect($cr, $x + $i * $bw + 2, $y + $h - $bh, $bw - 4, $bh, ...$this->col('accent'));
+                    }
+                }
+                break;
+            case 'tooltip':
+                Cairo::fillRect($cr, $x, $y, $w, $h, ...$this->col('text'));
+                Cairo::text($cr, $x + 6, $y + 15, (string) $el->prop('text', ''), 11, ...$this->col('surface'));
+                break;
+            case 'badge':
+                Cairo::fillRect($cr, $x, $y, $w, $h, ...$this->col('accent'));
+                Cairo::text($cr, $x + 6, $y + 15, (string) $el->prop('text', ''), 11, ...$this->col('surface'));
+                break;
+            case 'avatar':
+                Cairo::fillRect($cr, $x, $y, $w, $h, ...$this->col('accentSoft'));
+                Cairo::text($cr, $x + $w / 2 - 4, $y + $h / 2 + 4, strtoupper(substr((string) $el->prop('text', ''), 0, 1)), 14, ...$this->col('text'));
+                break;
+            case 'skeleton':
+                $lines = (int) $el->prop('lines', 3);
+                for ($i = 0; $i < $lines; $i++) {
+                    Cairo::fillRect($cr, $x + 4, $y + 4 + $i * 14, $w - 8, 8, ...$this->col('surfaceAlt'));
+                }
+                break;
+            case 'spinner':
+                Cairo::strokeRect($cr, $x, $y, $w, $h, ...$this->col('border'));
+                Cairo::text($cr, $x + $w / 2 - 4, $y + $h / 2 + 4, '…', 14, ...$this->col('text'));
+                break;
+            case 'switch':
+                $on = (bool) $el->prop('checked');
+                Cairo::fillRect($cr, $x, $y, 44, 22, ...($on ? $this->col('accent') : $this->col('border')));
+                Cairo::fillRect($cr, $x + ($on ? 22 : 2), $y + 2, 18, 18, ...$this->col('surface'));
+                break;
+            case 'richtext':
+                $ty = $y + 14;
+                foreach ($el->prop('spans', []) as $s) {
+                    $txt = (string) ($s['text'] ?? '');
+                    Cairo::text($cr, $x + 4, $ty, $txt, !empty($s['bold']) ? 13 : 12, ...$this->col('text'));
+                    $ty += 16;
+                }
+                break;
+            case 'breadcrumb':
+                $crumbs = $el->prop('crumbs', []);
+                $cx = $x + 4;
+                $cnt = count($crumbs);
+                foreach ($crumbs as $i => $c) {
+                    Cairo::text($cr, $cx, $y + 16, (string) $c, 12, ...$this->col('text'));
+                    $ew = Cairo::textExtents($cr, (string) $c)['w'];
+                    $cx += (int) $ew + 14;
+                    if ($i < $cnt - 1) {
+                        Cairo::text($cr, $cx - 10, $y + 16, '›', 12, ...$this->col('textMuted'));
+                    }
+                }
+                break;
+            case 'pagination':
+                $page = (int) $el->prop('page', 1);
+                $pages = (int) $el->prop('pages', 1);
+                Cairo::text($cr, $x + 4, $y + 16, "‹ $page / $pages ›", 12, ...$this->col('text'));
                 break;
             default:
                 Cairo::strokeRect($cr, $x, $y, $w, $h, 0.8, 0.4, 0.4);
@@ -731,6 +1132,11 @@ final class Canvas implements Backend
             && in_array($n->type, self::FOCUSABLE, true)) {
             Cairo::strokeRect($cr, $x - 1.5, $y - 1.5, $w + 3, $h + 3, 0.2, 0.4, 0.9, 2.0);
         }
+
+        if ($grouped) {
+            Cairo::popGroupToSource($cr);
+            Cairo::paintWithAlpha($cr, max(0.0, min(1.0, $alpha)));
+        }
     }
 
     private function drawToggle($cr, Element $el, float $x, float $y, float $w, float $h): void
@@ -740,29 +1146,29 @@ final class Canvas implements Backend
         $sw = 44;
         $swx = $x + $w - $sw;
         $sy = $y + ($h - 22) / 2;
-        Cairo::fillRect($cr, $swx, $sy, $sw, 22, $on ? 0.2 : 0.87, $on ? 0.78 : 0.76, $on ? 0.35 : 0.8);
+        Cairo::fillRect($cr, $swx, $sy, $sw, 22, ...($on ? $this->col('accent') : $this->col('border')));
         $kx = $on ? $swx + $sw - 22 : $swx + 2;
-        Cairo::fillRect($cr, $kx + 2, $sy + 2, 18, 18, 1, 1, 1);
+        Cairo::fillRect($cr, $kx + 2, $sy + 2, 18, 18, ...$this->col('surface'));
         if ($label !== '') {
-            Cairo::text($cr, $x + 2, $y + $h / 2 + 4, $label, 13, 0.1, 0.1, 0.1);
+            Cairo::text($cr, $x + 2, $y + $h / 2 + 4, $label, 13, ...$this->col('text'));
         }
     }
 
     private function drawIconButton($cr, Element $el, float $x, float $y, float $w, float $h): void
     {
-        Cairo::fillRect($cr, $x, $y, $w, $h, 0.93, 0.93, 0.95);
-        Cairo::strokeRect($cr, $x, $y, $w, $h, 0.6, 0.6, 0.65);
+        Cairo::fillRect($cr, $x, $y, $w, $h, ...$this->col('surface'));
+        Cairo::strokeRect($cr, $x, $y, $w, $h, ...$this->col('border'));
         $icon = (string) $el->prop('icon', '');
         $txt = (string) $el->prop('text', '');
         if ($icon !== '') {
-            Cairo::text($cr, $x + 8, $y + $h / 2 + 4, $icon, 13, 0.1, 0.1, 0.1);
+            Cairo::text($cr, $x + 8, $y + $h / 2 + 4, $icon, 13, ...$this->col('text'));
             if ($txt !== '') {
-                Cairo::text($cr, $x + 28, $y + $h / 2 + 4, $txt, 13, 0.1, 0.1, 0.1);
+                Cairo::text($cr, $x + 28, $y + $h / 2 + 4, $txt, 13, ...$this->col('text'));
             }
             return;
         }
         $e = Cairo::textExtents($cr, $txt);
-        Cairo::text($cr, $x + ($w - $e['w']) / 2, $y + $h / 2 + 4, $txt, 13, 0.1, 0.1, 0.1);
+        Cairo::text($cr, $x + ($w - $e['w']) / 2, $y + $h / 2 + 4, $txt, 13, ...$this->col('text'));
     }
 
     private function drawSegmented($cr, Element $el, float $x, float $y, float $w, float $h): void
@@ -771,42 +1177,43 @@ final class Canvas implements Backend
         $sel = (int) $el->prop('value', 0);
         $n = count($options) ?: 1;
         $seg = $w / $n;
-        Cairo::fillRect($cr, $x, $y, $w, $h, 0.89, 0.9, 0.92);
-        Cairo::strokeRect($cr, $x, $y, $w, $h, 0.7, 0.7, 0.75);
+        Cairo::fillRect($cr, $x, $y, $w, $h, ...$this->col('surface'));
+        Cairo::strokeRect($cr, $x, $y, $w, $h, ...$this->col('border'));
         for ($i = 0; $i < $n; $i++) {
             if ($i === $sel) {
-                Cairo::fillRect($cr, $x + $i * $seg + 2, $y + 2, $seg - 4, $h - 4, 1, 1, 1);
+                Cairo::fillRect($cr, $x + $i * $seg + 2, $y + 2, $seg - 4, $h - 4, ...$this->col('surfaceAlt'));
             }
             $txt = (string) ($options[$i] ?? '');
             $e = Cairo::textExtents($cr, $txt);
-            Cairo::text($cr, $x + $i * $seg + ($seg - $e['w']) / 2, $y + $h / 2 + 4, $txt, 13, 0.1, 0.1, 0.1);
+            Cairo::text($cr, $x + $i * $seg + ($seg - $e['w']) / 2, $y + $h / 2 + 4, $txt, 13, ...$this->col('text'));
         }
     }
 
     private function drawSearch($cr, Element $el, float $x, float $y, float $w, float $h): void
     {
-        Cairo::fillRect($cr, $x, $y, $w, $h, 1, 1, 1);
-        Cairo::strokeRect($cr, $x, $y, $w, $h, 0.7, 0.7, 0.75);
-        Cairo::text($cr, $x + 8, $y + $h / 2 + 4, '🔍', 13, 0.5, 0.5, 0.5);
+        Cairo::fillRect($cr, $x, $y, $w, $h, ...$this->col('surface'));
+        Cairo::strokeRect($cr, $x, $y, $w, $h, ...$this->col('border'));
+        Cairo::text($cr, $x + 8, $y + $h / 2 + 4, '🔍', 13, ...$this->col('textMuted'));
         $txt = (string) $el->prop('text', '');
         $showPlaceholder = $txt === '' && ((string) ($el->prop('id') ?? '') !== $this->focusId);
-        Cairo::text($cr, $x + 28, $y + $h / 2 + 4, $showPlaceholder ? (string) $el->prop('placeholder', '') : $txt, 13, $showPlaceholder ? 0.5 : 0.1, $showPlaceholder ? 0.5 : 0.1, $showPlaceholder ? 0.5 : 0.1);
+        $tc = $this->col($showPlaceholder ? 'textMuted' : 'text');
+        Cairo::text($cr, $x + 28, $y + $h / 2 + 4, $showPlaceholder ? (string) $el->prop('placeholder', '') : $txt, 13, ...$tc);
     }
 
     private function drawListItem($cr, Element $el, float $x, float $y, float $w, float $h): void
     {
-        Cairo::fillRect($cr, $x, $y, $w, $h, 1, 1, 1);
+        Cairo::fillRect($cr, $x, $y, $w, $h, ...$this->col('surface'));
         $icon = (string) $el->prop('icon', '');
         if ($icon !== '') {
-            Cairo::text($cr, $x + 10, $y + $h / 2 + 5, $icon, 14, 0.4, 0.45, 0.5);
+            Cairo::text($cr, $x + 10, $y + $h / 2 + 5, $icon, 14, ...$this->col('textMuted'));
         }
         $title = (string) $el->prop('title', '');
         $sub = (string) $el->prop('subtitle', '');
         if ($sub !== '') {
-            Cairo::text($cr, $x + 36, $y + 16, $title, 13, 0.1, 0.1, 0.1);
-            Cairo::text($cr, $x + 36, $y + 34, $sub, 12, 0.45, 0.45, 0.5);
+            Cairo::text($cr, $x + 36, $y + 16, $title, 13, ...$this->col('text'));
+            Cairo::text($cr, $x + 36, $y + 34, $sub, 12, ...$this->col('textMuted'));
         } else {
-            Cairo::text($cr, $x + 36, $y + $h / 2 + 4, $title, 13, 0.1, 0.1, 0.1);
+            Cairo::text($cr, $x + 36, $y + $h / 2 + 4, $title, 13, ...$this->col('text'));
         }
     }
 
@@ -814,31 +1221,31 @@ final class Canvas implements Backend
     {
         $vertical = $el->prop('orientation') === 'vertical';
         $pos = (float) $el->prop('position', 0.5);
-        Cairo::fillRect($cr, $x, $y, $w, $h, 0.98, 0.98, 0.99);
+        Cairo::fillRect($cr, $x, $y, $w, $h, ...$this->col('bg'));
         if ($vertical) {
             $dy = (int) ($y + $pos * $h);
-            Cairo::fillRect($cr, $x, $dy - 3, $w, 6, 0.83, 0.85, 0.88);
+            Cairo::fillRect($cr, $x, $dy - 3, $w, 6, ...$this->col('surfaceAlt'));
         } else {
             $dx = (int) ($x + $pos * $w);
-            Cairo::fillRect($cr, $dx - 3, $y, 6, $h, 0.83, 0.85, 0.88);
+            Cairo::fillRect($cr, $dx - 3, $y, 6, $h, ...$this->col('surfaceAlt'));
         }
     }
 
     private function drawStrip($cr, string $type, float $x, float $y, float $w, float $h): void
     {
         $bg = match ($type) {
-            'sidebar' => [0.95, 0.96, 0.97],
-            'statusbar' => [0.98, 0.98, 0.99],
-            default => [0.92, 0.93, 0.95],
+            'sidebar' => $this->col('surfaceAlt'),
+            'statusbar' => $this->col('bg'),
+            default => $this->col('surfaceAlt'),
         };
-        Cairo::fillRect($cr, $x, $y, $w, $h, $bg[0], $bg[1], $bg[2]);
+        Cairo::fillRect($cr, $x, $y, $w, $h, ...$bg);
     }
 
     private function drawPlaceholder($cr, float $x, float $y, float $w, float $h, string $label): void
     {
-        Cairo::fillRect($cr, $x, $y, $w, $h, 0.93, 0.94, 0.95);
-        Cairo::strokeRect($cr, $x, $y, $w, $h, 0.8, 0.8, 0.82);
-        Cairo::text($cr, $x + 10, $y + 22, $label, 12, 0.45, 0.45, 0.5);
+        Cairo::fillRect($cr, $x, $y, $w, $h, ...$this->col('surface'));
+        Cairo::strokeRect($cr, $x, $y, $w, $h, ...$this->col('border'));
+        Cairo::text($cr, $x + 10, $y + 22, $label, 12, ...$this->col('textMuted'));
     }
 
     /** Pointer drag: MOVE updates a slider's value; UP ends the drag. */

@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  # Daily automation: build + test the GUI library every night.
+  schedule:
+    - cron: '0 6 * * *'
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        include:
+          # Windows backend is implemented but untested in this repo's CI loop.
+          - os: windows-latest
+            continue-on-error: true
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: ffi
+          coverage: none
+          tools: composer
+
+      - name: Install X11 dev headers (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist
+
+      - name: Build native libui3
+        run: bash ext/build.sh
+
+      - name: Make lib findable (Windows)
+        if: runner.os == 'Windows'
+        run: copy build\libui3.dll libui3.dll
+
+      - name: Run Pest tests
+        run: composer test
+
+      - name: Run automation example (headless record-replay)
+        run: composer automation
+
+      - name: Run widget gallery example (headless)
+        run: composer widgets

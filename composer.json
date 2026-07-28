@@ -1,0 +1,45 @@
+{
+    "name": "yangweijie/ui3",
+    "description": "Cross-platform GUI library for PHP via FFI (参考 native)",
+    "type": "library",
+    "license": "MIT",
+    "autoload": {
+        "psr-4": {
+            "Yangweijie\\Ui3\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Tests\\": "tests/"
+        }
+    },
+    "authors": [
+        {
+            "name": "jay",
+            "email": "917647288@qq.com"
+        }
+    ],
+    "minimum-stability": "dev",
+    "require": {
+        "php": ">=8.2",
+        "ext-ffi": "*",
+        "kingbes/phpc": "dev-main"
+    },
+    "require-dev": {
+        "pestphp/pest": "5.x-dev"
+    },
+    "scripts": {
+        "build": "bash ext/build.sh",
+        "test": "bash bin/run.sh php -d ffi.enable=true vendor/bin/pest",
+        "example": "bash bin/run.sh php -d ffi.enable=true examples/counter.php",
+        "automation": "bash bin/run.sh php -d ffi.enable=true examples/automation.php",
+        "widgets": "bash bin/run.sh php -d ffi.enable=true examples/widgets.php",
+        "canvas": "bash bin/run.sh php -d ffi.enable=true examples/canvas.php"
+    },
+    "config": {
+        "allow-plugins": {
+            "pestphp/pest-plugin": true,
+            "pestphp/pest": true
+        }
+    }
+}

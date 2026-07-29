@@ -251,11 +251,81 @@
 - Verification: `composer test` 全量 **132 passed / 430 assertions / 1 skipped**（0 failed，含 `list` 基线 ReferenceRenderTest 无回归）；新增 `virtual list control draws an overlay scrollbar after interaction`（像素验证滚动条画出）、`dragging the list scrollbar thumb scrolls the list`（拖到轨道中点→offset=maxOff/2）、`clicking the list scrollbar track jumps the list there`（轨道跳转，off-by-one 已用 `(int)` 截断对齐）。
 - 已知限制：**水平滚动仍待实现**；非虚拟 items 列表（`virtual` 缺省）仍走旧的全部行渲染（双击+偏移由 list_item 节点，行为同前，未改）；list 内嵌于 scroll 容器时其滚动条可能越出外层裁剪（罕见，未处理）。
 
+### P0.1: 文本编辑原语（caret/选区/undo/右键菜单）（2026-07-29）
+- **Status:** done
+- 背景：对比 native SDK，最缺的是"真正的文本编辑原语"——原生控件自带 caret、选区、undo/redo、右键菜单。本仓库是 libui-free 单 Cairo 表面，所有控件在 PHP 层手绘，故这些原语须在 PHP 编辑缓冲里自己实现。
+- Actions:
+  - `Canvas` 编辑缓冲升级为 `['text','cursor','sel','undo','redo']`；`editText()` 支持 Ctrl+a/c/x/v/z/y、Shift+方向键(选区扩展)、Home/End、Delete、Backspace（修正 `"\b"` 与 `"\x08"` 不匹配的 bug）、可打印字符插入（含选区替换）。
+  - 新增 `pushUndo`/`doUndo`/`doRedo`/`deleteSelection`/`deleteAt`/`replaceSelection`/`emitInput`/`caretVisible`/`drawFieldText`/`fieldCaretXY`/`drawFieldSelection`/`fieldSelectionRange`，绘制 caret 与选区高亮。
+  - `common.c` 增加 Home/End/Delete + Shift+方向键令牌；`cocoa.m` 增加 Ctrl 修饰符（发 `"Ctrl+<key>"`）；`win32.c` 增加 VK_HOME/END/DELETE；`x11.c` 增加 XK_Home/End/Delete。
+  - `App` 增加 `backend()`/`clipboard()`/`setClipboard()` 委托；`LibUi3.php` 与 `libui3.h` 同步 cdef。
+- Files: `src/Backends/Canvas.php`, `src/App.php`, `src/FFI/LibUi3.php`, `ext/libui3.h`, `ext/common.c`, `ext/cocoa.m`, `ext/win32.c`, `ext/x11.c`, `tests/TextEditTest.php`
+- Verification: `composer test` 全量 **138 passed / 446 assertions / 1 skipped**（0 failed）；6 个 P0.1 编辑测试（Shift+选区替换、Home/End、Delete、Ctrl+Z/Y、Ctrl+A+X+V、Ctrl+C）通过。
+
+### P0.2: 原生剪切板（2026-07-29）
+- **Status:** done
+- Actions:
+  - `Canvas::setClipboard/clipboard` 接线到 FFI `ui3_host_set/get_clipboard_text`；仅在真实窗口（`!isHeadless()`）调用原生，headless 退化到内存镜像（保持测试稳定）。`copy`/`cut` 现在同时写入原生剪切板，`paste` 从原生（或内存）读取。
+  - `App::clipboard/setClipboard` 委托到 Canvas 后端。
+  - 三平台宿主实现：`cocoa.m`（NSPasteboard）、`win32.c`（Win32 Clipboard API）、`x11.c`（popen 到 `xclip`/`xsel`，零构建依赖，helper 缺失时静默降级）。
+- Files: `src/Backends/Canvas.php`, `src/App.php`, `ext/cocoa.m`, `ext/win32.c`, `ext/x11.c`, `tests/ClipboardDialogTest.php`
+- Verification: 新增 `ClipboardDialogTest` 6 测试（set/get round-trip、App 委托、copy/cut 落剪切板、paste 插入）headless 全绿；`composer test` 全量 **144 passed / 454 assertions / 1 skipped**（0 failed）；`bash ext/build.sh` 重建成功（macOS）。
+- 已知限制：原生剪切板路径无法在 headless 下单测，需在带显示环境手动验证一次（macOS/win32 走系统 API，x11 走 xclip/xsel）；x11 `set_clipboard` 经临时文件喂给 xclip/xsel 以规避 shell 转义。
+
+### P0.3: 文件打开/保存对话框（2026-07-29）
+- **Status:** done
+- Actions:
+  - `Canvas::openFile(?filters)/saveFile(?defext)` 接线到 FFI `ui3_host_open/save_file`；headless 或无 host 时返回 `null`（不弹窗、不阻塞）。`App::openFile/saveFile` 委托到 Canvas。
+  - 三平台宿主实现：`cocoa.m`（NSOpenPanel/NSSavePanel）、`win32.c`（GetOpenFileName/GetSaveFileName）、`x11.c`（popen 到 `zenity --file-selection` 或 `kdialog`，零构建依赖，helper 缺失时返回 NULL）。
+- Files: `src/Backends/Canvas.php`, `src/App.php`, `src/FFI/LibUi3.php`, `ext/libui3.h`, `ext/cocoa.m`, `ext/win32.c`, `ext/x11.c`, `tests/ClipboardDialogTest.php`
+- Verification: `openFile/saveFile` 在 headless 下返回 `null` 的护栏测试通过；`composer test` 全量 **144 passed / 454 assertions / 1 skipped**（0 failed）；`bash ext/build.sh` 重建成功（macOS，仅 `setAllowedFileTypes:` 弃用告警，无害）。
+- 已知限制：真实对话框无法在 headless 下自动化；x11 的 `filters`/`defext` 参数当前未映射给 GTK chooser 的过滤语法（留待后续）；macOS 保存面板已换 `allowedContentTypes`（见 P0.4）。
+
+### P0.4: 文本编辑右键上下文菜单 + x11 切到 GTK + macOS 保存面板弃用修复（2026-07-29）
+- **Status:** done
+- 背景：P0.1 完成了 caret/选区/undo，但"右键上下文菜单"这一项 native SDK 标配能力仍缺；同时用户要求 x11 走 GTK、并修掉 macOS 保存面板 `setAllowedFileTypes:` 弃用告警。
+- Actions:
+  - **右键上下文菜单（文本字段）**：三平台宿主把鼠标右键归一化为 `button=2`（cocoa `rightMouseDown:`、win32 `WM_RBUTTONDOWN`、x11 鼠标键 3）；`inject_pointer` 增加 `button` 参数（`common.c`/`libui3.h`/`LibUi3.php` cdef 同步）。PHP `onEvent` 增加 `handleContextMenuPointer`：右键命中 input/textarea/search 时先 `applyFocus` 再打开内置编辑菜单（Undo/Redo/Cut/Copy/Paste/Select All），命中带 `contextMenu` prop 的元素时打开其自定义菜单；菜单在 `paint()` 顶层手绘（`drawContextMenu`）；点击菜单项经 `hitContextMenu`→`runContextMenuItem`（`action` 映射到 `undoEdit/redoEdit/cut/copy/paste/selectAll`，`msg` 则 `dispatch`）；点击菜单外或 `Escape` 关闭菜单。
+  - **Escape 终接通路**：`ui3_key_text` 原先缺 keycode 53 分支，导致 `\x1b` 令牌从未产生；补 `case 53: return strdup("\x1b")`，使菜单/下拉的 Esc 关闭真正生效（三平台统一）。
+  - **x11 切到 GTK**：`x11.c` 的剪切板/文件对话框改为 GTK 3 实现（`GtkClipboard` / `GtkFileChooserDialog`），`gtk_init_check` 懒初始化、失败静默降级；原 xclip/zenity 方案移除。`ext/build.sh` Linux 分支经 `pkg-config` 引入 `gtk+-3.0` cflags/libs。
+  - **macOS 保存面板弃用修复**：`cocoa.m` 用 `UTType typeWithFilenameExtension:` + `setAllowedContentTypes:` 替换 `setAllowedFileTypes:`；`ext/build.sh` macOS分支链接 `-framework UniformTypeIdentifiers`。
+- Files: `src/Backends/Canvas.php`, `src/FFI/LibUi3.php`, `ext/libui3.h`, `ext/common.c`, `ext/cocoa.m`, `ext/win32.c`, `ext/x11.c`, `ext/build.sh`, `tests/ContextMenuTest.php`
+- Verification: 新增 `ContextMenuTest` 4 测试（右键打开内置菜单、点击 Copy 复制选区、Escape 关闭、自定义 `contextMenu` prop 右键打开）headless 全绿；`composer test` 全量 **148 passed / 469 assertions / 1 skipped**（0 failed）；`bash ext/build.sh` 重建成功（macOS，无告警）。
+- 已知限制：GTK/x11 路径无法在本机（macOS）编译验证，需在 Linux + GTK 环境构建一次；右键菜单项 hover 高亮、次级菜单、剪切板内容预览等增强未做；`filters`/`defext` 仍仅原样透传给 GTK chooser（未做平台特定过滤语法）。
+
+### P0.5: 右键菜单增强（hover 高亮 / 次级菜单 / 剪切板预览）+ 文件对话框平台过滤语法（2026-07-29）
+- **Status:** done
+- 背景：P0.4 交付了右键上下文菜单，但用户要求补三项成熟度增强——hover 高亮、次级菜单、剪切板内容预览；并要求把文件对话框的 `filters`/`defext` 从"仅原样透传"升级为各平台特定过滤语法。
+- Actions:
+  - **hover 高亮**：`openContextMenu` 记录 `hover` 索引；`onEvent` 的 `POINTER_MOVE` 在菜单打开时改走 `updateMenuHover`，对命中行用 `accentSoft` 填充高亮；移出菜单清零。
+  - **次级菜单**：菜单项支持 `['submenu' => [...]]`；hover 到带 `submenu` 的父行时 `openSubmenu` 在其右侧（越界则翻到左侧）展开子菜单，子菜单同样可 hover 高亮；点击子项经 `hitContextMenu`（`sub=>true`）→`runContextMenuItem` 执行并关闭整个菜单；点击父行/预览行保持打开。
+  - **剪切板内容预览**：菜单项支持 `['preview' => 'clipboard']`，绘制时读取实时 clipboard 文本（空时显示 `(empty)`，超长截断 40 字并加省略号），以 muted 色渲染在标题之后；该行为非命令，点击不关闭菜单。内置编辑菜单新增首行 `Clipboard` 预览行。
+  - **文件对话框平台过滤语法**：`internal.h` 新增 `ui3_filter_group` 与共享解析器 `ui3_parse_filters`（规格 `"png,jpg"` 或 `"Images:png,jpg;Text:txt,md"`；扩展名可带或不带前导点；每条自动追加 `All Files`）。各平台接入：
+    - GTK (`x11.c`)：按组创建 `GtkFileFilter`（`*.ext` pattern）+ `All Files`；保存对话框用 `defext` 建过滤器并 `set_current_name("untitled.<defext>")`。
+    - macOS (`cocoa.m`)：open 把各组扩展名映射为 `UTType` 设 `allowedContentTypes`；save 用 `defext` 设 `allowedContentTypes` 并 `setNameFieldStringValue("untitled.<defext>")`。
+    - Win32 (`win32.c`)：open 拼 `lpstrFilter`（双 NUL 终止 `"Label\0*.a;*.b\0..."`）+ `All Files`；save 用 `defext` 建过滤器、`lpstrDefExt`、默认文件名 `untitled.<defext>`。
+  - **测试/文档**：`ContextMenuTest` 新增 3 测试（hover 高亮、次级菜单打开并选中、剪切板预览内容）；`App.php`/`Canvas.php` 的 `openFile`/`saveFile` 注释补充过滤语法；`openFile` 文档增加规格说明。
+- Files: `src/Backends/Canvas.php`, `src/App.php`, `ext/internal.h`, `ext/common.c`, `ext/cocoa.m`, `ext/win32.c`, `ext/x11.c`, `tests/ContextMenuTest.php`
+- Verification: `composer test` 全量 **151 passed / 481 assertions / 1 skipped**（0 failed，较 P0.4 +3）；`bash ext/build.sh` 重建成功（macOS，无告警）。
+- 已知限制：GTK (`x11.c`)/Win32 (`win32.c`) 路径无法在本机（macOS）编译验证，需在 Linux + GTK / Windows 环境各构建一次确认。
+
+### P0.6: 右键菜单深度扩展（多级嵌套子菜单 / 图标 / 勾选态）（2026-07-29）
+- **Status:** done
+- 背景：P0.5 交付了单层次级菜单与剪切板预览，但用户要求继续扩展——支持**多级（递归）嵌套子菜单**、菜单项**图标**、以及**勾选态**。
+- Actions:
+  - **多级嵌套子菜单**：把原先单层的 `submenu` 键改为 `submenus` 面板列表（根菜单 + 任意层级的子菜单面板）。`updateMenuHover` 改为在指针命中的**最深面板**上做悬停追踪：hover 到带 `submenu` 的父行时，在该行右侧（越界翻左、纵向夹取）展开下一级子菜单；若已是对的行则保留、否则以新面板替换其下所有层级；hover 到无子菜单的行或根菜单其它行则关闭其下所有层级。`hitContextMenu`/`runContextMenuItem`/`handleContextMenuPointer`/`drawContextMenu` 全部改用 `depth` 定位面板，支持任意层级命中/点击/绘制。
+  - **图标**：菜单项支持 `['icon' => '<glyph>']`，`contextMenuSize` 在任一菜单项含 `icon`/`checked` 时预留 22px 左栏（`gutter`），`drawMenu` 在该栏绘制 glyph（沿用图标文字绘制通道）。
+  - **勾选态**：菜单项支持 `['checked' => bool]`，左栏在 `checked` 为真时绘制 `✓`（accent 文本色）、为假时留空保持对齐；勾选态不影响点击行为（点击仍派发 `msg`，由应用侧决定状态）。
+  - **测试/文档**：`ContextMenuTest` 新增 3 测试（多级嵌套展开、点击最深层项派发并关闭、icon+checked 数据透传且菜单因左栏变宽）；`Ui::contextMenu` 补条目结构 docblock（含 `submenu`/`icon`/`checked`/`preview`/`action`/`msg`）。新增公共访问器 `contextSubmenuDepth`/`contextSubmenuLevelItems`/`contextSubmenuLevelRect`。
+- Files: `src/Backends/Canvas.php`, `src/Ui.php`, `tests/ContextMenuTest.php`
+- Verification: `composer test` 全量 **154 passed / 498 assertions / 1 skipped**（0 failed，较 P0.5 +3）；ContextMenuTest 10 passed / 44 assertions。
+- 已知限制：GTK/Win32 原生路径仍无法在本机编译验证（本次仅改 PHP 后端，未触碰 `ext/`）；图标以文本 glyph 渲染，依赖运行环境字体对相应字形（如 emoji）的支持。
+
 ## 5-Question Reboot Check
 | Question | Answer |
 |----------|--------|
 | Where am I? | 全部完成（Phase 1-10 + 测试脚本/示例 + P0 渲染底座/像素回归 + P1 常驻 ticker/文本测量 + P2 headless/IME/Reference 覆盖/Html 动画 + P3 Canvas IME parity/P2 示例） |
-| Where am I going? | — 收尾 —（scroll 裁剪已完成，无剩余已知限制） |
+| Where am I going? | — 收尾 —（scroll 裁剪已完成；右键菜单已增强至多级/图标/勾选态；剩余：GTK/Win32 原生路径需在 Linux+GTK / Windows 各构建一次确认，图标依赖运行环境字体字形支持） |
 | What's the goal? | 补齐十个方向(功能级最小实现) + 可运行示例与 CI 友好测试脚本 |
 | What have I learned? | bin/run.sh 可自动构建 libui3（UI3_SKIP_BUILD 跳过）；Html/systems 示例可不依赖原生库纯 PHP 运行 |
 | What have I done? | Phase 1-10 完成；测试脚本支持自动构建；新增 9 个示例覆盖各新能力；P1-P3 成熟度提升均带回归测试 |

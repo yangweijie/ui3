@@ -137,8 +137,36 @@
 - [x] `tests/ScrollInteractionTest.php`：键盘箭头滚动 + WHEEL 滚动 + 滚动后仍裁剪
 - Status: done
 
+### P0.1: 文本编辑原语（caret/选区/undo/右键菜单）
+- [x] `input`/`textarea` caret 与选区绘制、undo/redo 栈；文本编辑右键上下文菜单（撤销/重做/剪切/复制/粘贴/全选）
+- Status: done
+
+### P0.2: 原生剪切板
+- [x] 原生 clipboard 接入（copy/paste），headless 经 `setClipboard` 模拟
+- Status: done
+
+### P0.3: 文件打开/保存对话框
+- [x] `App::openFile`/`saveFile` 接入原生对话框；`filters`/`defext` 透传
+- Status: done
+
+### P0.4: 文本编辑右键上下文菜单 + x11 切 GTK + macOS 保存面板弃用修复
+- [x] 上下文菜单 hover/选区/命令；`x11.c` 改走 GTK chooser；`cocoa.m` 保存面板弃用 API 修复
+- Status: done
+
+### P0.5: 右键菜单增强（hover/次级菜单/剪切板预览）+ 文件对话框平台过滤语法
+- [x] hover 高亮（accentSoft）、单层次级菜单（hover 展开）、剪切板实时预览行
+- [x] `filters`/`defext` 各平台特定过滤语法：`common.c` 共享 `ui3_parse_filters`；GTK/Cocoa/Win32 各自接入（label:ext,ext + 自动 All Files）
+- Status: done
+
+### P0.6: 右键菜单深度扩展（多级嵌套/图标/勾选态）
+- [x] `submenu` 单层键改为 `submenus` 面板列表，递归多级嵌套；`updateMenuHover` 在命中最深面板追踪悬停
+- [x] 菜单项支持 `icon`（glyph 左栏）与 `checked`（✓ 左栏）；`contextMenuSize`/`drawMenu` 预留 22px 左栏
+- [x] `hitContextMenu`/`runContextMenuItem`/`drawContextMenu` 改用 `depth` 定位；新增 `contextSubmenuDepth`/`contextSubmenuLevelItems`/`contextSubmenuLevelRect`
+- [x] `ContextMenuTest` +3（多级嵌套/深层点击/icon+checked）；`Ui::contextMenu` 补条目结构 docblock
+- Status: done
+
 ## All phases complete
-十个方向全部补齐：主题/令牌、布局引擎、缺失组件、动画、事件/输入、状态/响应式、无障碍、多窗口、Web 目标、其他系统。P0/P1 渲染底座与动画/文本成熟度已提升。
+十个方向全部补齐：主题/令牌、布局引擎、缺失组件、动画、事件/输入、状态/响应式、无障碍、多窗口、Web 目标、其他系统。P0–P1 渲染底座、动画/文本/IME 成熟度、scroll 裁剪与交互、文本编辑原语/剪切板/文件对话框、右键菜单增强与多级嵌套/图标/勾选态均已落地。
 
 ## Key Decisions
 - 每方向三层(DSL+Canvas+自动化)最小实现，可被 MCP 观测。

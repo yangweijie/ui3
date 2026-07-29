@@ -121,6 +121,51 @@ final class App
         return $el;
     }
 
+    /** The active rendering backend (null before run()). */
+    public function backend(): ?Backend
+    {
+        return $this->backend;
+    }
+
+    /** Current clipboard contents (synced with the native host when a real window is shown). */
+    public function clipboard(): string
+    {
+        return $this->backend instanceof Backends\Canvas ? $this->backend->clipboard() : '';
+    }
+
+    public function setClipboard(string $text): void
+    {
+        if ($this->backend instanceof Backends\Canvas) {
+            $this->backend->setClipboard($text);
+        }
+    }
+
+    /**
+     * Open a native file chooser; null if cancelled or no real window is shown.
+     *
+     * @param string|null $filters File-type filter spec, applied per-platform:
+     *     "png,jpg"                  single unlabeled group ("Files")
+     *     "Images:png,jpg;Text:txt"  one or more labeled groups
+     *     Extensions may include or omit the leading dot. An "All Files" entry
+     *     is always appended so the user can bypass the filter.
+     */
+    public function openFile(?string $filters = null): ?string
+    {
+        return $this->backend instanceof Backends\Canvas ? $this->backend->openFile($filters) : null;
+    }
+
+    /**
+     * Open a native save dialog; null if cancelled or no real window is shown.
+     *
+     * @param string|null $defext Default extension (e.g. "png"), used to set the
+     *     dialog's filter and the default filename ("untitled.<defext>"). The
+     *     leading dot is optional.
+     */
+    public function saveFile(?string $defext = null): ?string
+    {
+        return $this->backend instanceof Backends\Canvas ? $this->backend->saveFile($defext) : null;
+    }
+
     /** Register an extension hook at a lifecycle point (beforeRender/afterRender/afterUpdate). */
     public function extend(string $point, callable $hook): self
     {

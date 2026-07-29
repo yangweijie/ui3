@@ -1,5 +1,6 @@
 #import "internal.h"
 #import <Cocoa/Cocoa.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <cairo/cairo.h>
 #import <cairo/cairo-quartz.h>
 
@@ -75,11 +76,13 @@ static void cocoa_paint(ui3_host *host, CGContextRef cg)
     NSPoint p = [self convertPoint:[e locationInWindow] fromView:nil];
     host->event_cb(host->event_ctx,
                    down ? UI3_EVENT_POINTER_DOWN : UI3_EVENT_POINTER_UP,
-                   p.x, p.y, (double)e.buttonNumber, NULL);
+                   p.x, p.y, (double)((int)e.buttonNumber + 1), NULL);
 }
 
 - (void)mouseDown:(NSEvent *)e { [self forwardEvent:e down:1]; }
 - (void)mouseUp:(NSEvent *)e   { [self forwardEvent:e down:0]; }
+- (void)rightMouseDown:(NSEvent *)e { [self forwardEvent:e down:1]; }
+- (void)rightMouseUp:(NSEvent *)e   { [self forwardEvent:e down:0]; }
 - (void)forwardMove:(NSEvent *)e {
     ui3_host *host = self.host;
     if (!host || !host->event_cb) return;
@@ -119,8 +122,26 @@ static void cocoa_paint(ui3_host *host, CGContextRef cg)
     ui3_host *host = self.host;
     if (!host || !host->event_cb) return;
     int shift = (e.modifierFlags & NSEventModifierFlagShift) ? 1 : 0;
-    char *text = ui3_key_text((int)e.keyCode, shift, [e.characters UTF8String]);
+    int ctrl  = (e.modifierFlags & NSEventModifierFlagControl) ? 1 : 0;
+    const char *chars = [e.characters UTF8String];
+    /* Ctrl combos: -characters carries a control char (e.g. "\x01" for Ctrl+A);
+     * use the unmodified base so we emit "Ctrl+a" not "Ctrl+\x01". */
+    if (ctrl && chars && chars[0] && (unsigned char)chars[0] < 0x20) {
+        chars = [e.charactersIgnoringModifiers UTF8String];
+    }
+    char *text = ui3_key_text((int)e.keyCode, shift, chars);
     if (!text) return;
+    /* Prefix printable keys with "Ctrl+" so PHP can bind shortcuts (P0.1). */
+    if (ctrl && text[0] && (unsigned char)text[0] >= 0x20 && text[0] != '\t') {
+        size_t L = strlen(text);
+        char *ct = (char *)malloc(L + 6);
+        if (ct) {
+            memcpy(ct, "Ctrl+", 5);
+            memcpy(ct + 5, text, L + 1);
+            free(text);
+            text = ct;
+        }
+    }
     host->event_cb(host->event_ctx, UI3_EVENT_KEY, 0, 0, 0, text);
     free(text);
 }
@@ -260,4 +281,97 @@ void ui3_plat_destroy(ui3_host *host)
     [win close];
     free(p);
     host->plat = NULL;
+}
+
+/* ---- System clipboard (P0.2) ---- */
+void ui3_host_set_clipboard_text(ui3_host *host, const char *text)
+{
+    (void)host;
+    if (!text) return;
+    @autoreleasepool {
+        NSPasteboard *pb = [NSPasteboard generalPasteboard];
+        [pb clearContents];
+        [pb setString:[NSString stringWithUTF8String:text] forType:NSPasteboardTypeString];
+    }
+}
+
+char *ui3_host_get_clipboard_text(ui3_host *host)
+{
+    (void)host;
+    static char *g = NULL;
+    @autoreleasepool {
+        NSPasteboard *pb = [NSPasteboard generalPasteboard];
+        NSString *s = [pb stringForType:NSPasteboardTypeString];
+        if (!s) { free(g); g = NULL; return NULL; }
+        const char *u = [s UTF8String];
+        size_t L = strlen(u);
+        char *n = (char *)malloc(L + 1);
+        if (!n) { free(g); g = NULL; return NULL; }
+        memcpy(n, u, L + 1);
+        free(g); g = n;
+    }
+    return g;
+}
+
+/* ---- Modal file dialogs (P0.3) ---- */
+char *ui3_host_open_file(ui3_host *host, const char *filters)
+{
+    (void)host;
+    static char *g = NULL;
+    @autoreleasepool {
+        NSOpenPanel *panel = [NSOpenPanel openPanel];
+        [panel setCanChooseFiles:YES];
+        [panel setCanChooseDirectories:NO];
+        [panel setAllowsMultipleSelection:NO];
+        if (filters && filters[0]) {
+            ui3_filter_group groups[8];
+            int ng = ui3_parse_filters(filters, groups, 8);
+            if (ng > 0) {
+                NSMutableArray *uts = [NSMutableArray array];
+                for (int i = 0; i < ng; i++) {
+                    for (int j = 0; j < groups[i].nexts; j++) {
+                        UTType *ut = [UTType typeWithFilenameExtension:[NSString stringWithUTF8String:groups[i].exts[j]]];
+                        if (ut && ![uts containsObject:ut]) [uts addObject:ut];
+                    }
+                }
+                if (uts.count) { panel.allowedContentTypes = uts; }
+            }
+        }
+        if ([panel runModal] == NSModalResponseOK) {
+            NSURL *url = panel.URLs.firstObject;
+            if (url) {
+                const char *u = [[url path] UTF8String];
+                free(g); g = strdup(u);
+                return g;
+            }
+        }
+    }
+    free(g); g = NULL;
+    return NULL;
+}
+
+char *ui3_host_save_file(ui3_host *host, const char *defext)
+{
+    (void)host;
+    static char *g = NULL;
+    @autoreleasepool {
+        NSSavePanel *panel = [NSSavePanel savePanel];
+        if (defext && defext[0]) {
+            UTType *ut = [UTType typeWithFilenameExtension:[NSString stringWithUTF8String:defext]];
+            if (ut) {
+                [panel setAllowedContentTypes:@[ut]];
+            }
+            [panel setNameFieldStringValue:[NSString stringWithFormat:@"untitled.%s", defext]];
+        }
+        if ([panel runModal] == NSModalResponseOK) {
+            NSURL *url = panel.URL;
+            if (url) {
+                const char *u = [[url path] UTF8String];
+                free(g); g = strdup(u);
+                return g;
+            }
+        }
+    }
+    free(g); g = NULL;
+    return NULL;
 }

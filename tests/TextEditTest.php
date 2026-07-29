@@ -114,3 +114,78 @@ test('field shows the typed value, not the placeholder', function () {
     expect($canvas->fieldDisplayText('v-input'))->toBe('world');
     expect($auto->model()['v'])->toBe('world');
 });
+
+/**
+ * P0.1 — selection by Shift+Arrow, then typing replaces the selection.
+ * rawKey(123, true) carries the Shift modifier through ui3_key_text, which now
+ * emits the "\x11" (KEY_SHIFT_LEFT) token so the editor can extend a selection.
+ */
+test('Shift+Arrow selects and typing replaces the selection', function () {
+    $auto = (new Automation(editApp(), new Canvas(headless: true)))->start();
+    $auto->focus('v-input');
+    $auto->type('hello');                 // cursor at 5
+    $auto->rawKey(123, true);             // Shift+Left -> selection [4,5]
+    $auto->rawKey(123, true);             // Shift+Left -> selection [3,5]
+    expect($auto->backend()->fieldSelectionRange('v-input'))->toBe([3, 5]);
+
+    $auto->type('XY');                    // replaces "lo" -> "helXY"
+    expect($auto->fieldText('v-input'))->toBe('helXY');
+    expect($auto->fieldCursor('v-input'))->toBe(5);
+});
+
+test('Home and End move the cursor to the ends', function () {
+    $auto = (new Automation(editApp(), new Canvas(headless: true)))->start();
+    $auto->focus('v-input');
+    $auto->type('hello');
+    $auto->cursorLeft();
+    $auto->cursorLeft();                  // cursor at 3
+    $auto->rawKey(115);                   // Home
+    expect($auto->fieldCursor('v-input'))->toBe(0);
+    $auto->rawKey(119);                   // End
+    expect($auto->fieldCursor('v-input'))->toBe(5);
+});
+
+test('Delete removes the character after the cursor', function () {
+    $auto = (new Automation(editApp(), new Canvas(headless: true)))->start();
+    $auto->focus('v-input');
+    $auto->type('hello');
+    $auto->rawKey(115);                   // Home -> cursor 0
+    $auto->rawKey(117);                   // Delete -> "ello"
+    expect($auto->fieldText('v-input'))->toBe('ello');
+    expect($auto->fieldCursor('v-input'))->toBe(0);
+});
+
+test('Ctrl+Z undoes and Ctrl+Y redoes the last edit', function () {
+    $auto = (new Automation(editApp(), new Canvas(headless: true)))->start();
+    $auto->focus('v-input');
+    $auto->type('hello');
+    $auto->backspace();                   // deletes 'o' -> "hell"
+    expect($auto->fieldText('v-input'))->toBe('hell');
+    $auto->pressKey('Ctrl+z'); // undo -> "hello"
+    expect($auto->fieldText('v-input'))->toBe('hello');
+    $auto->pressKey('Ctrl+y'); // redo -> "hell"
+    expect($auto->fieldText('v-input'))->toBe('hell');
+});
+
+test('Ctrl+A selects all, Ctrl+X cuts to clipboard, Ctrl+V pastes', function () {
+    $auto = (new Automation(editApp(), new Canvas(headless: true)))->start();
+    $auto->focus('v-input');
+    $auto->type('hello');
+    $auto->pressKey('Ctrl+a'); // select all
+    expect($auto->backend()->fieldSelectionRange('v-input'))->toBe([0, 5]);
+    $auto->pressKey('Ctrl+x'); // cut
+    expect($auto->fieldText('v-input'))->toBe('');
+    expect($auto->backend()->clipboard())->toBe('hello');
+    $auto->pressKey('Ctrl+v'); // paste
+    expect($auto->fieldText('v-input'))->toBe('hello');
+});
+
+test('Ctrl+C copies the selection without modifying the field', function () {
+    $auto = (new Automation(editApp(), new Canvas(headless: true)))->start();
+    $auto->focus('v-input');
+    $auto->type('hello');
+    $auto->pressKey('Ctrl+a');
+    $auto->pressKey('Ctrl+c');
+    expect($auto->backend()->clipboard())->toBe('hello');
+    expect($auto->fieldText('v-input'))->toBe('hello'); // unchanged
+});

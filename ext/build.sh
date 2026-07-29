@@ -23,10 +23,14 @@ fi
 case "$UNAME" in
   Darwin)
     platform_src="ext/cocoa.m"
-    libs+=(-framework Cocoa -framework CoreFoundation)
+    libs+=(-framework Cocoa -framework CoreFoundation -framework UniformTypeIdentifiers)
     ;;
   Linux)
     platform_src="ext/x11.c"
+    gtk_cflags="$(pkg-config --cflags gtk+-3.0 2>/dev/null || true)"
+    gtk_libs="$(pkg-config --libs gtk+-3.0 2>/dev/null || true)"
+    [ -n "$gtk_cflags" ] && cflags+=($gtk_cflags)
+    [ -n "$gtk_libs" ] && libs+=($gtk_libs)
     libs+=(-lX11)
     ;;
   MINGW* | MSYS* | Windows_NT)

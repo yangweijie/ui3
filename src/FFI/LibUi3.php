@@ -36,12 +36,16 @@ void  ui3_host_present(void* host);
 double ui3_host_scale(void* host);
 int   ui3_host_width(void* host);
 int   ui3_host_height(void* host);
-void  ui3_host_inject_pointer(void* host, double x, double y, int down);
+void  ui3_host_inject_pointer(void* host, double x, double y, int down, int button);
 void  ui3_host_inject_move(void* host, double x, double y);
 void  ui3_host_inject_key(void* host, const char* text);
 int   ui3_host_is_headless(void* host);
 void  ui3_host_inject_raw_key(void* host, int keycode, int shift, const char* chars);
 void  ui3_host_post_key(void* host, int keycode, int shift, const char* chars);
+void  ui3_host_set_clipboard_text(void* host, const char* text);
+char* ui3_host_get_clipboard_text(void* host);
+char* ui3_host_open_file(void* host, const char* filters);
+char* ui3_host_save_file(void* host, const char* defext);
 C;
 
     private static function libName(): string

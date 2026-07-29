@@ -374,8 +374,17 @@ final class Ui
     }
 
     /**
-     * Attach a right-click context menu to an element. Items are
-     * [['title' => string, 'msg' => string], ...]; selecting one dispatches $msg.
+     * Attach a right-click context menu to an element.
+     *
+     * Each item is an associative array with:
+     *  - 'title'    => string (required)
+     *  - 'msg'      => string  — dispatch this message when selected
+     *  - 'action'   => string  — run a built-in edit action (undo/redo/cut/copy/paste/selectAll)
+     *  - 'submenu'  => array   — nested menu items (multi-level, recursion allowed)
+     *  - 'preview'  => 'clipboard' — live clipboard-preview row (non-selectable)
+     *  - 'icon'     => string  — glyph drawn in the leading gutter
+     *  - 'checked'  => bool    — draw a check mark in the leading gutter when true
+     * Rows with 'submenu' (and no 'msg'/'action') open a submenu on hover.
      */
     public static function contextMenu(Element $el, array $items): Element
     {

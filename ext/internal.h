@@ -41,4 +41,21 @@ void ui3_plat_post_key(ui3_host *host, int keycode, int shift, const char *chars
 /* Canonical key-text mapping, shared by native keyDown and inject_raw_key. */
 char *ui3_key_text(int keycode, int shift, const char *chars);
 
+/* File-dialog filter parsing, shared by every platform so the caller never
+ * re-implements platform-specific filter syntax.
+ *
+ * Format:
+ *   "ext1,ext2"                     -> single unlabeled group "Files"
+ *   "Label1:ext1,ext2;Label2:ext3"  -> multiple labeled groups
+ *
+ * Extensions may be written with or without a leading dot; each group may hold
+ * up to 24 extensions. Returns the number of groups written (capped at max). */
+typedef struct {
+    char label[64];
+    char exts[24][16];
+    int  nexts;
+} ui3_filter_group;
+
+int ui3_parse_filters(const char *spec, ui3_filter_group *groups, int max);
+
 #endif /* INTERNAL_H */

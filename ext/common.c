@@ -143,10 +143,10 @@ static void push_inject(ui3_host *host, int kind, double x, double y, double dat
     host->inject_tail = &n->next;
 }
 
-void ui3_host_inject_pointer(ui3_host *host, double x, double y, int down)
+void ui3_host_inject_pointer(ui3_host *host, double x, double y, int down, int button)
 {
     if (!host) return;
-    push_inject(host, down ? UI3_EVENT_POINTER_DOWN : UI3_EVENT_POINTER_UP, x, y, 0, NULL);
+    push_inject(host, down ? UI3_EVENT_POINTER_DOWN : UI3_EVENT_POINTER_UP, x, y, (double)button, NULL);
 }
 
 void ui3_host_inject_move(void *host, double x, double y)
@@ -181,17 +181,92 @@ char *ui3_key_text(int keycode, int shift, const char *chars)
 {
     switch (keycode) {
         case 48:  return strdup(shift ? "Shift+Tab" : "Tab");
-        case 123: return strdup("\x01");   /* ArrowLeft  */
-        case 124: return strdup("\x02");   /* ArrowRight */
-        case 126: return strdup("\x03");   /* ArrowUp    */
-        case 125: return strdup("\x04");   /* ArrowDown  */
+        case 123: return strdup(shift ? "\x11" : "\x01");   /* ArrowLeft  */
+        case 124: return strdup(shift ? "\x12" : "\x02");   /* ArrowRight */
+        case 126: return strdup(shift ? "\x13" : "\x03");   /* ArrowUp    */
+        case 125: return strdup(shift ? "\x14" : "\x04");   /* ArrowDown  */
+        case 115: return strdup("\x05");   /* Home  */
+        case 119: return strdup("\x06");   /* End   */
+        case 117: return strdup("\x07");   /* ForwardDelete */
         case 36:  case 76: return strdup("\n");   /* Return / Enter */
         case 51:  return strdup("\b");     /* Backspace  */
+        case 53:  return strdup("\x1b");   /* Escape     */
         default:
             /* Any key that produced printable characters (incl. with Shift). */
             if (chars && chars[0] != '\0') return strdup(chars);
             return NULL;                    /* ignore Function/modifier-only keys */
     }
+}
+
+/* Parse a comma-separated extension list into a filter group, stripping any
+ * leading dot or surrounding spaces, and capping at the group's capacity. */
+static void ui3_parse_exts(ui3_filter_group *g, const char *exts)
+{
+    char buf[256];
+    strncpy(buf, exts, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    char *p = buf;
+    while (*p && g->nexts < 24) {
+        char *comma = strchr(p, ',');
+        if (comma) *comma = '\0';
+        char *e = p;
+        while (*e == '.' || *e == ' ') e++;
+        int len = (int)strlen(e);
+        if (len > 0 && g->nexts < 24) {
+            strncpy(g->exts[g->nexts], e, 15);
+            g->exts[g->nexts][15] = '\0';
+            g->nexts++;
+        }
+        if (!comma) break;
+        p = comma + 1;
+    }
+}
+
+int ui3_parse_filters(const char *spec, ui3_filter_group *groups, int max)
+{
+    int ng = 0;
+    if (!spec || !*spec || max <= 0) return 0;
+
+    int has_label = 0;
+    for (const char *p = spec; *p; p++) {
+        if (*p == ':') { has_label = 1; break; }
+    }
+
+    char buf[1024];
+    strncpy(buf, spec, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    if (!has_label) {
+        if (ng < max) {
+            memset(&groups[ng], 0, sizeof(groups[ng]));
+            strncpy(groups[ng].label, "Files", sizeof(groups[ng].label) - 1);
+            ui3_parse_exts(&groups[ng], buf);
+            ng++;
+        }
+        return ng;
+    }
+
+    char *p = buf;
+    while (*p && ng < max) {
+        char *semi = strchr(p, ';');
+        if (semi) *semi = '\0';
+        memset(&groups[ng], 0, sizeof(groups[ng]));
+        char *colon = strchr(p, ':');
+        if (colon) {
+            int ll = (int)(colon - p);
+            if (ll > 63) ll = 63;
+            memcpy(groups[ng].label, p, ll);
+            groups[ng].label[ll] = '\0';
+            ui3_parse_exts(&groups[ng], colon + 1);
+        } else {
+            strncpy(groups[ng].label, "Files", sizeof(groups[ng].label) - 1);
+            ui3_parse_exts(&groups[ng], p);
+        }
+        ng++;
+        if (!semi) break;
+        p = semi + 1;
+    }
+    return ng;
 }
 
 /* Drive a key by raw scancode + modifiers through the SAME translation the

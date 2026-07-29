@@ -47,7 +47,7 @@ int ui3_host_width(ui3_host *host);
 int ui3_host_height(ui3_host *host);
 
 /* Input injection for automation / headless driving. */
-void ui3_host_inject_pointer(ui3_host *host, double x, double y, int down);
+void ui3_host_inject_pointer(ui3_host *host, double x, double y, int down, int button);
 void ui3_host_inject_move(void *host, double x, double y);
 void ui3_host_inject_key(ui3_host *host, const char *text);
 int  ui3_host_is_headless(void *host);
@@ -57,5 +57,16 @@ void ui3_host_inject_raw_key(ui3_host *host, int keycode, int shift, const char 
  * real window -> a synthesized native key event through the platform key path
  * (e.g. Cocoa window.keyDown: -> routeKey). Lets automation verify the real path. */
 void ui3_host_post_key(ui3_host *host, int keycode, int shift, const char *chars);
+
+/* System clipboard (UTF-8 text). get_clipboard_text returns a malloc'd string
+ * (caller reads it immediately) or NULL when empty. */
+void  ui3_host_set_clipboard_text(ui3_host *host, const char *text);
+char *ui3_host_get_clipboard_text(ui3_host *host);
+
+/* Modal file dialogs. Returns a malloc'd path or NULL when cancelled.
+ * open_file: filters is a comma-separated extension list (e.g. "png,jpg") or "".
+ * save_file: defext is the default extension (e.g. "png") or "". */
+char *ui3_host_open_file(ui3_host *host, const char *filters);
+char *ui3_host_save_file(ui3_host *host, const char *defext);
 
 #endif /* LIBUI3_H */

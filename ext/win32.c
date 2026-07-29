@@ -26,6 +26,9 @@ static int win32_key_id(int vk)
         case VK_DOWN:   return 125;
         case VK_RETURN: return 36;
         case VK_BACK:   return 51;
+        case VK_HOME:   return 115;
+        case VK_END:    return 119;
+        case VK_DELETE: return 117;
         default:        return 0;
     }
 }
@@ -58,12 +61,22 @@ static LRESULT CALLBACK win32_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         case WM_LBUTTONDOWN:
             if (host->event_cb)
                 host->event_cb(host->event_ctx, UI3_EVENT_POINTER_DOWN,
-                               (double)GET_X_LPARAM(lParam), (double)GET_Y_LPARAM(lParam), 0, NULL);
+                               (double)GET_X_LPARAM(lParam), (double)GET_Y_LPARAM(lParam), 1, NULL);
             return 0;
         case WM_LBUTTONUP:
             if (host->event_cb)
                 host->event_cb(host->event_ctx, UI3_EVENT_POINTER_UP,
-                               (double)GET_X_LPARAM(lParam), (double)GET_Y_LPARAM(lParam), 0, NULL);
+                               (double)GET_X_LPARAM(lParam), (double)GET_Y_LPARAM(lParam), 1, NULL);
+            return 0;
+        case WM_RBUTTONDOWN:
+            if (host->event_cb)
+                host->event_cb(host->event_ctx, UI3_EVENT_POINTER_DOWN,
+                               (double)GET_X_LPARAM(lParam), (double)GET_Y_LPARAM(lParam), 2, NULL);
+            return 0;
+        case WM_RBUTTONUP:
+            if (host->event_cb)
+                host->event_cb(host->event_ctx, UI3_EVENT_POINTER_UP,
+                               (double)GET_X_LPARAM(lParam), (double)GET_Y_LPARAM(lParam), 2, NULL);
             return 0;
         case WM_MOUSEWHEEL: {
             if (host->event_cb) {
@@ -210,6 +223,151 @@ void ui3_plat_run(ui3_host *host)
             DispatchMessage(&msg);
         }
     }
+}
+
+/* ---- System clipboard (P0.2) ---- */
+void ui3_host_set_clipboard_text(ui3_host *host, const char *text)
+{
+    (void)host;
+    if (!text) return;
+    if (!OpenClipboard(NULL)) return;
+    EmptyClipboard();
+    HGLOBAL h = GlobalAlloc(GMEM_MOVABLE, strlen(text) + 1);
+    if (h) {
+        char *p = (char *)GlobalLock(h);
+        if (p) {
+            memcpy(p, text, strlen(text) + 1);
+            GlobalUnlock(h);
+        }
+        SetClipboardData(CF_TEXT, h);
+    }
+    CloseClipboard();
+}
+
+char *ui3_host_get_clipboard_text(ui3_host *host)
+{
+    (void)host;
+    static char *g = NULL;
+    if (!OpenClipboard(NULL)) return NULL;
+    HANDLE h = GetClipboardData(CF_TEXT);
+    char *r = NULL;
+    if (h) {
+        char *p = (char *)GlobalLock(h);
+        if (p) {
+            size_t L = strlen(p);
+            char *n = (char *)malloc(L + 1);
+            if (n) {
+                memcpy(n, p, L + 1);
+                r = n;
+            }
+            GlobalUnlock(h);
+        }
+    }
+    CloseClipboard();
+    free(g);
+    g = r;
+    return g;
+}
+
+/* ---- Modal file dialogs (P0.3) ---- */
+char *ui3_host_open_file(ui3_host *host, const char *filters)
+{
+    (void)host;
+    static char *g = NULL;
+    ui3_filter_group groups[8];
+    int ng = ui3_parse_filters(filters, groups, 8);
+
+    static char fbuf[1024];
+    fbuf[0] = '\0';
+    int pos = 0;
+    for (int i = 0; i < ng; i++) {
+        int l = (int)strlen(groups[i].label);
+        if (pos + l + 1 >= (int)sizeof(fbuf)) break;
+        memcpy(fbuf + pos, groups[i].label, l); pos += l; fbuf[pos++] = '\0';
+        int start = pos;
+        for (int j = 0; j < groups[i].nexts; j++) {
+            char pat[32];
+            snprintf(pat, sizeof(pat), "*.%s", groups[i].exts[j]);
+            int pl = (int)strlen(pat);
+            if (pos + pl + 1 >= (int)sizeof(fbuf)) break;
+            memcpy(fbuf + pos, pat, pl); pos += pl;
+            if (j + 1 < groups[i].nexts) fbuf[pos++] = ';';
+        }
+        if (pos == start) { fbuf[pos++] = '*'; fbuf[pos++] = '.'; fbuf[pos++] = '*'; }
+        fbuf[pos++] = '\0';
+    }
+    {
+        const char *lbl = "All Files";
+        int ll = (int)strlen(lbl);
+        if (pos + ll + 1 < (int)sizeof(fbuf)) { memcpy(fbuf + pos, lbl, ll); pos += ll; fbuf[pos++] = '\0'; }
+        const char *pat = "*.*";
+        int pl = (int)strlen(pat);
+        if (pos + pl + 1 < (int)sizeof(fbuf)) { memcpy(fbuf + pos, pat, pl); pos += pl; fbuf[pos++] = '\0'; }
+    }
+    fbuf[pos++] = '\0';
+
+    OPENFILENAME ofn;
+    char buf[1024];
+    memset(&ofn, 0, sizeof(ofn));
+    memset(buf, 0, sizeof(buf));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFile = buf;
+    ofn.nMaxFile = sizeof(buf);
+    ofn.lpstrFilter = fbuf;
+    ofn.nFilterIndex = 1;
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+    if (GetOpenFileName(&ofn)) {
+        free(g);
+        g = strdup(buf);
+        return g;
+    }
+    return NULL;
+}
+
+char *ui3_host_save_file(ui3_host *host, const char *defext)
+{
+    (void)host;
+    static char *g = NULL;
+    static char fbuf[512];
+    fbuf[0] = '\0';
+    int pos = 0;
+    if (defext && *defext) {
+        char name[64];
+        int l = snprintf(name, sizeof(name), "*.%s", defext);
+        if (pos + l + 1 < (int)sizeof(fbuf)) { memcpy(fbuf + pos, name, l); pos += l; fbuf[pos++] = '\0'; }
+        if (pos + l + 1 < (int)sizeof(fbuf)) { memcpy(fbuf + pos, name, l); pos += l; fbuf[pos++] = '\0'; }
+        const char *lbl = "All Files";
+        int ll = (int)strlen(lbl);
+        if (pos + ll + 1 < (int)sizeof(fbuf)) { memcpy(fbuf + pos, lbl, ll); pos += ll; fbuf[pos++] = '\0'; }
+        memcpy(fbuf + pos, "*.*", 3); pos += 3; fbuf[pos++] = '\0';
+    } else {
+        const char *lbl = "All Files";
+        int ll = (int)strlen(lbl);
+        if (pos + ll + 1 < (int)sizeof(fbuf)) { memcpy(fbuf + pos, lbl, ll); pos += ll; fbuf[pos++] = '\0'; }
+        memcpy(fbuf + pos, "*.*", 3); pos += 3; fbuf[pos++] = '\0';
+    }
+    fbuf[pos++] = '\0';
+
+    OPENFILENAME ofn;
+    char buf[1024];
+    memset(&ofn, 0, sizeof(ofn));
+    memset(buf, 0, sizeof(buf));
+    if (defext && *defext) {
+        snprintf(buf, sizeof(buf), "untitled.%s", defext);
+    }
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFile = buf;
+    ofn.nMaxFile = sizeof(buf);
+    ofn.lpstrFilter = fbuf;
+    ofn.nFilterIndex = 1;
+    ofn.lpstrDefExt = (defext && *defext) ? defext : NULL;
+    ofn.Flags = OFN_OVERWRITEPROMPT;
+    if (GetSaveFileName(&ofn)) {
+        free(g);
+        g = strdup(buf);
+        return g;
+    }
+    return NULL;
 }
 
 void ui3_plat_destroy(ui3_host *host)

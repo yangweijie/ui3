@@ -45,6 +45,9 @@ static int x11_key_id(KeySym sym)
         case XK_Return:
         case XK_KP_Enter:     return 36;
         case XK_BackSpace:    return 51;
+        case XK_Home:         return 115;
+        case XK_End:          return 119;
+        case XK_Delete:       return 117;
         default:              return 0;
     }
 }
@@ -90,15 +93,17 @@ static void x11_dispatch(x11_plat *p, XEvent *ev)
                     host->event_cb(host->event_ctx, UI3_EVENT_WHEEL,
                                    (double)ev->xbutton.x, (double)ev->xbutton.y, dy, NULL);
                 } else {
+                    int btn = (ev->xbutton.button == 3) ? 2 : 1;
                     host->event_cb(host->event_ctx, UI3_EVENT_POINTER_DOWN,
-                                   (double)ev->xbutton.x, (double)ev->xbutton.y, 0, NULL);
+                                   (double)ev->xbutton.x, (double)ev->xbutton.y, (double)btn, NULL);
                 }
             }
             break;
         case ButtonRelease:
             if (host->event_cb)
+                int btn = (ev->xbutton.button == 3) ? 2 : 1;
                 host->event_cb(host->event_ctx, UI3_EVENT_POINTER_UP,
-                               (double)ev->xbutton.x, (double)ev->xbutton.y, 0, NULL);
+                               (double)ev->xbutton.x, (double)ev->xbutton.y, (double)btn, NULL);
             break;
         case MotionNotify:
             if (host->event_cb)
@@ -217,4 +222,115 @@ void ui3_plat_destroy(ui3_host *host)
     if (p->dpy) XCloseDisplay(p->dpy);
     free(p);
     host->plat = NULL;
+}
+
+/* ---- Native clipboard & file dialogs (Linux/X11, via GTK 3) -----------------
+ * Raw X11 has no clipboard or file-dialog API; GTK provides portable ones that
+ * interoperate with the rest of the desktop. GTK is initialized lazily (and only
+ * once) on first use, so headless/server builds that never touch these paths
+ * are unaffected. If GTK can't initialize (e.g. no display) the calls degrade
+ * gracefully to no-op / NULL. */
+
+#include <gtk/gtk.h>
+
+static gboolean x11_gtk_inited = FALSE;
+
+static gboolean x11_ensure_gtk(void)
+{
+    if (!x11_gtk_inited) {
+        int argc = 0;
+        char **argv = NULL;
+        x11_gtk_inited = gtk_init_check(&argc, &argv);
+    }
+    return x11_gtk_inited;
+}
+
+void ui3_host_set_clipboard_text(void *host, const char *text)
+{
+    (void)host;
+    if (!text) return;
+    if (!x11_ensure_gtk()) return;
+    GtkClipboard *cb = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    gtk_clipboard_set_text(cb, text, -1);
+}
+
+char *ui3_host_get_clipboard_text(void *host)
+{
+    (void)host;
+    if (!x11_ensure_gtk()) return NULL;
+    GtkClipboard *cb = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    gchar *s = gtk_clipboard_wait_for_text(cb);
+    if (!s) return NULL;
+    static char *g = NULL;
+    free(g);
+    g = strdup(s);
+    g_free(s);
+    return g;
+}
+
+char *ui3_host_open_file(void *host, const char *filters)
+{
+    (void)host;
+    if (!x11_ensure_gtk()) return NULL;
+    GtkWidget *dlg = gtk_file_chooser_dialog_new(
+        "Open File", NULL, GTK_FILE_CHOOSER_ACTION_OPEN,
+        "_Open", GTK_RESPONSE_ACCEPT, "_Cancel", GTK_RESPONSE_CANCEL, NULL);
+    ui3_filter_group groups[8];
+    int ng = ui3_parse_filters(filters, groups, 8);
+    if (ng > 0) {
+        for (int i = 0; i < ng; i++) {
+            GtkFileFilter *f = gtk_file_filter_new();
+            gtk_file_filter_set_name(f, groups[i].label);
+            for (int j = 0; j < groups[i].nexts; j++) {
+                char pat[32];
+                snprintf(pat, sizeof(pat), "*.%s", groups[i].exts[j]);
+                gtk_file_filter_add_pattern(f, pat);
+            }
+            gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dlg), f);
+        }
+        /* "All Files" fallback so users can bypass the filter. */
+        GtkFileFilter *all = gtk_file_filter_new();
+        gtk_file_filter_set_name(all, "All Files");
+        gtk_file_filter_add_pattern(all, "*");
+        gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dlg), all);
+    }
+    char *result = NULL;
+    if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
+        char *fn = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dlg));
+        if (fn) { result = strdup(fn); g_free(fn); }
+    }
+    gtk_widget_destroy(dlg);
+    while (gtk_events_pending()) gtk_main_iteration();
+    return result;
+}
+
+char *ui3_host_save_file(void *host, const char *defext)
+{
+    (void)host;
+    if (!x11_ensure_gtk()) return NULL;
+    GtkWidget *dlg = gtk_file_chooser_dialog_new(
+        "Save File", NULL, GTK_FILE_CHOOSER_ACTION_SAVE,
+        "_Save", GTK_RESPONSE_ACCEPT, "_Cancel", GTK_RESPONSE_CANCEL, NULL);
+    gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(dlg), TRUE);
+    if (defext && *defext) {
+        GtkFileFilter *f = gtk_file_filter_new();
+        char pat[32], name[64];
+        snprintf(pat, sizeof(pat), "*.%s", defext);
+        snprintf(name, sizeof(name), "*.%s", defext);
+        gtk_file_filter_set_name(f, name);
+        gtk_file_filter_add_pattern(f, pat);
+        gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dlg), f);
+        gtk_file_chooser_set_filter(GTK_FILE_CHOOSER(dlg), f);
+        char defname[64];
+        snprintf(defname, sizeof(defname), "untitled.%s", defext);
+        gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(dlg), defname);
+    }
+    char *result = NULL;
+    if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
+        char *fn = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dlg));
+        if (fn) { result = strdup(fn); g_free(fn); }
+    }
+    gtk_widget_destroy(dlg);
+    while (gtk_events_pending()) gtk_main_iteration();
+    return result;
 }

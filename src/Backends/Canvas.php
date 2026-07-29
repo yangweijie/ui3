@@ -68,15 +68,29 @@ final class Canvas implements Backend
     /** Scroll container id activated by pointer-down, for arrow-key scrolling. */
     private ?string $activeScrollId = null;
 
+    /** In-memory clipboard mirror; synced to the native host clipboard when a real window exists. */
+    private string $clipboard = '';
+
     private const POINTER_DOWN = 1;
     private const POINTER_UP = 2;
     private const POINTER_MOVE = 3;
     private const KEY = 4;
     private const KEY_ESC = "\x1b";
+    private const MB_LEFT = 1;   // normalized pointer button: left
+    private const MB_RIGHT = 2;  // normalized pointer button: right
+    private const MENU_ROW_H = 24;
+    private const MENU_PAD = 8;
     private const KEY_LEFT = "\x01";
     private const KEY_RIGHT = "\x02";
     private const KEY_UP = "\x03";
     private const KEY_DOWN = "\x04";
+    private const KEY_HOME = "\x05";
+    private const KEY_END = "\x06";
+    private const KEY_DEL = "\x07";
+    private const KEY_SHIFT_LEFT = "\x11";
+    private const KEY_SHIFT_RIGHT = "\x12";
+    private const KEY_SHIFT_UP = "\x13";
+    private const KEY_SHIFT_DOWN = "\x14";
     /** Mouse-wheel event (host ABI UI3_EVENT_WHEEL). data = pixels scrolled. */
     private const WHEEL = 5;
     /** Widget types that join the Tab order and show a focus ring. */
@@ -260,19 +274,27 @@ final class Canvas implements Backend
         $this->requestRedraw();
     }
 
-    /** Open the context menu attached to an element (right-click equivalent). */
-    public function openContextMenu(string $id): void
+    /** Open the context menu attached to an element (right-click equivalent).
+     *  $x/$y position the menu (clamped to the window); $items overrides the
+     *  element's `contextMenu` prop (used for the built-in text-edit menu). */
+    public function openContextMenu(string $id, float $x = 0.0, float $y = 0.0, ?array $items = null): void
     {
         $node = $this->findNodeById($id);
         if ($node === null) {
             return;
         }
-        $items = $node->el->prop('contextMenu');
-        if (is_array($items) && $items !== []) {
-            $this->contextMenus[$id] = $items;
-            if ($this->host) {
-                Phpc::call($this->ffi, 'ui3_host_request_redraw', [$this->host]);
-            }
+        $items ??= $node->el->prop('contextMenu');
+        if (!is_array($items) || $items === []) {
+            return;
+        }
+        [$mw, $mh] = $this->contextMenuSize($items);
+        [$cx, $cy] = $this->clampMenuPos($x, $y, $mw, $mh);
+        $this->contextMenus[$id] = [
+            'x' => $cx, 'y' => $cy, 'w' => $mw, 'h' => $mh, 'items' => $items,
+            'hover' => -1, 'submenus' => [],
+        ];
+        if ($this->host) {
+            Phpc::call($this->ffi, 'ui3_host_request_redraw', [$this->host]);
         }
     }
 
@@ -290,10 +312,447 @@ final class Canvas implements Backend
     /** Items of an open context menu (empty if none). */
     public function contextMenuItems(string $id): array
     {
-        return $this->contextMenus[$id] ?? [];
+        return $this->contextMenus[$id]['items'] ?? [];
+    }
+
+    /** Bounding rect [x, y, w, h] of an open context menu, or null. */
+    public function contextMenuRect(string $id): ?array
+    {
+        $menu = $this->contextMenus[$id] ?? null;
+        return $menu === null ? null : [$menu['x'], $menu['y'], $menu['w'], $menu['h']];
+    }
+
+    /** Bounding rect [x, y, w, h] of a single menu row, or null. */
+    public function contextMenuItemRect(string $id, int $index): ?array
+    {
+        $menu = $this->contextMenus[$id] ?? null;
+        if ($menu === null || $index < 0 || $index >= count($menu['items'])) {
+            return null;
+        }
+        return [
+            $menu['x'],
+            $menu['y'] + self::MENU_PAD + $index * self::MENU_ROW_H,
+            $menu['w'],
+            self::MENU_ROW_H,
+        ];
+    }
+
+    /** Hovered row index of an open context menu (-1 = none), or -1 if closed. */
+    public function contextMenuHover(string $id): int
+    {
+        return $this->contextMenus[$id]['hover'] ?? -1;
+    }
+
+    /** Items of the deepest open submenu (empty if none). */
+    public function contextSubmenuItems(string $id): array
+    {
+        $subs = $this->contextMenus[$id]['submenus'] ?? [];
+        return $subs === [] ? [] : end($subs)['items'];
+    }
+
+    /** Bounding rect [x, y, w, h] of the deepest open submenu, or null. */
+    public function contextSubmenuRect(string $id): ?array
+    {
+        $subs = $this->contextMenus[$id]['submenus'] ?? [];
+        if ($subs === []) {
+            return null;
+        }
+        $s = end($subs);
+        return [$s['x'], $s['y'], $s['w'], $s['h']];
+    }
+
+    /** Bounding rect [x, y, w, h] of a single deepest-submenu row, or null. */
+    public function contextSubmenuItemRect(string $id, int $i): ?array
+    {
+        $subs = $this->contextMenus[$id]['submenus'] ?? [];
+        if ($subs === []) {
+            return null;
+        }
+        return $this->menuItemRect(end($subs), $i);
+    }
+
+    /** Hovered row index of the deepest open submenu (-1 = none). */
+    public function contextSubmenuHover(string $id): int
+    {
+        $subs = $this->contextMenus[$id]['submenus'] ?? [];
+        return $subs === [] ? -1 : end($subs)['hover'];
+    }
+
+    /** Number of open submenu levels (0 = none, 1 = single, 2+ = nested). */
+    public function contextSubmenuDepth(string $id): int
+    {
+        return count($this->contextMenus[$id]['submenus'] ?? []);
+    }
+
+    /** Items of the open submenu at a 1-based level (empty if absent). */
+    public function contextSubmenuLevelItems(string $id, int $level): array
+    {
+        $subs = $this->contextMenus[$id]['submenus'] ?? [];
+        return ($level >= 1 && isset($subs[$level - 1])) ? $subs[$level - 1]['items'] : [];
+    }
+
+    /** Bounding rect [x, y, w, h] of the open submenu at a 1-based level, or null. */
+    public function contextSubmenuLevelRect(string $id, int $level): ?array
+    {
+        $subs = $this->contextMenus[$id]['submenus'] ?? [];
+        if ($level < 1 || !isset($subs[$level - 1])) {
+            return null;
+        }
+        $s = $subs[$level - 1];
+        return [$s['x'], $s['y'], $s['w'], $s['h']];
+    }
+
+    /** Computed clipboard-preview text for a preview row (null if not a preview). */
+    public function contextMenuPreviewText(string $id, int $i): ?string
+    {
+        $menu = $this->contextMenus[$id] ?? null;
+        if ($menu === null || $i < 0 || $i >= count($menu['items'])) {
+            return null;
+        }
+        return $this->menuPreviewText($menu['items'][$i]);
+    }
+
+    private function menuItemRect(array $menu, int $i): array
+    {
+        return [
+            $menu['x'],
+            $menu['y'] + self::MENU_PAD + $i * self::MENU_ROW_H,
+            $menu['w'],
+            self::MENU_ROW_H,
+        ];
+    }
+
+    private function rowIndexAt(array $menu, float $x, float $y): int
+    {
+        $idx = (int)floor(($y - $menu['y'] - self::MENU_PAD) / self::MENU_ROW_H);
+        return ($idx >= 0 && $idx < count($menu['items'])) ? $idx : -1;
+    }
+
+    private function pointInRect(float $x, float $y, float $mx, float $my, float $mw, float $mh): bool
+    {
+        return $x >= $mx && $x <= $mx + $mw && $y >= $my && $y <= $my + $mh;
+    }
+
+    private function menuPreviewText(array $it): ?string
+    {
+        if (!isset($it['preview']) || $it['preview'] !== 'clipboard') {
+            return null;
+        }
+        $text = $this->clipboard();
+        if ($text === '') {
+            return '(empty)';
+        }
+        $max = 40;
+        return mb_strlen($text) > $max ? mb_substr($text, 0, $max) . '…' : $text;
+    }
+
+    /** Build a submenu panel hanging off a parent row (no deeper children yet). */
+    private function makeSubmenuPanel(string $id, int $parentDepth, int $parentIndex, array $parentPanel): array
+    {
+        $items = $parentPanel['items'][$parentIndex]['submenu'] ?? null;
+        if (!is_array($items) || $items === []) {
+            return [];
+        }
+        [$mw, $mh] = $this->contextMenuSize($items);
+        $pr = $this->menuItemRect($parentPanel, $parentIndex);
+        $ww = $this->root ? (int)$this->root->prop('width', 320) : 320;
+        $wh = $this->root ? (int)$this->root->prop('height', 240) : 240;
+        $sx = $pr[0] + $pr[2];
+        if ($sx + $mw > $ww) {
+            $sx = $pr[0] - $mw;
+        }
+        $sy = $pr[1];
+        if ($sy + $mh > $wh) {
+            $sy = max(0, $wh - $mh);
+        }
+        return [
+            'parent' => $parentIndex,
+            'items' => $items,
+            'x' => (float)$sx, 'y' => (float)$sy, 'w' => $mw, 'h' => $mh,
+            'hover' => -1,
+        ];
+    }
+
+    /** Track which row (and which nested submenu) the pointer is over while a menu is open. */
+    private function updateMenuHover(float $x, float $y): void
+    {
+        $changed = false;
+        foreach ($this->contextMenus as $id => $menuData) {
+            $menu = $menuData;
+            $panels = array_merge([$menu], $menu['submenus']);
+            // Deepest panel (topmost) containing the pointer wins.
+            $foundAt = -1;
+            for ($k = count($panels) - 1; $k >= 0; $k--) {
+                $p = $panels[$k];
+                if ($this->pointInRect($x, $y, $p['x'], $p['y'], $p['w'], $p['h'])) {
+                    $foundAt = $k;
+                    break;
+                }
+            }
+            if ($foundAt === -1) {
+                // Pointer outside every panel: clear root hover, close all submenus.
+                if ($menu['hover'] !== -1) {
+                    $menu['hover'] = -1;
+                    $changed = true;
+                }
+                if ($menu['submenus'] !== []) {
+                    $menu['submenus'] = [];
+                    $changed = true;
+                }
+                $this->contextMenus[$id] = $menu;
+                continue;
+            }
+            $panel = $panels[$foundAt];
+            $idx = $this->rowIndexAt($panel, $x, $y);
+            if ($panel['hover'] !== $idx) {
+                $panel['hover'] = $idx;
+                $changed = true;
+            }
+            $item = ($idx >= 0 && isset($panel['items'][$idx])) ? $panel['items'][$idx] : null;
+            $hasSub = is_array($item)
+                && isset($item['submenu'])
+                && !isset($item['action'])
+                && !isset($item['msg']);
+            if ($hasSub) {
+                $next = $panels[$foundAt + 1] ?? null;
+                if ($next !== null && ($next['parent'] ?? -1) === $idx) {
+                    // Correct submenu already open; prune anything deeper.
+                    if (count($panels) > $foundAt + 2) {
+                        $menu['submenus'] = array_slice($menu['submenus'], 0, $foundAt + 1);
+                        $changed = true;
+                    }
+                } else {
+                    // Replace everything below this row with a fresh submenu.
+                    $newPanel = $this->makeSubmenuPanel($id, $foundAt, $idx, $panel);
+                    $menu['submenus'] = array_slice($menu['submenus'], 0, $foundAt);
+                    if ($newPanel !== []) {
+                        $menu['submenus'][] = $newPanel;
+                    }
+                    $changed = true;
+                }
+            } else {
+                // Close deeper submenus below this panel.
+                if (count($panels) > $foundAt + 1) {
+                    $menu['submenus'] = array_slice($menu['submenus'], 0, $foundAt);
+                    $changed = true;
+                }
+            }
+            // Write the (possibly updated) hover back into the right panel.
+            if ($foundAt === 0) {
+                $menu['hover'] = $panel['hover'];
+            } else {
+                $menu['submenus'][$foundAt - 1]['hover'] = $panel['hover'];
+            }
+            $this->contextMenus[$id] = $menu;
+        }
+        if ($changed) {
+            $this->requestRedraw();
+        }
     }
 
     /** Dispatch a gesture (e.g. 'swipe') recognized on an element. */
+    private function contextMenuSize(array $items): array
+    {
+        $hasGutter = false;
+        foreach ($items as $it) {
+            if (isset($it['icon']) || isset($it['checked'])) {
+                $hasGutter = true;
+                break;
+            }
+        }
+        $gutter = $hasGutter ? 22 : 0;
+        $w = 0;
+        foreach ($items as $it) {
+            $titleW = mb_strlen((string)($it['title'] ?? '')) * 7 + 24 + $gutter;
+            if (isset($it['preview'])) {
+                $titleW = max($titleW, 260 + $gutter);
+            }
+            $w = max($w, $titleW);
+        }
+        $h = count($items) * self::MENU_ROW_H + 2 * self::MENU_PAD;
+        return [(float)$w, (float)$h];
+    }
+
+    private function clampMenuPos(float $x, float $y, float $mw, float $mh): array
+    {
+        $ww = $this->root ? (int)$this->root->prop('width', 320) : 320;
+        $wh = $this->root ? (int)$this->root->prop('height', 240) : 240;
+        $cx = min(max($x, 0.0), max(0.0, $ww - $mw));
+        $cy = min(max($y, 0.0), max(0.0, $wh - $mh));
+        return [(float)$cx, (float)$cy];
+    }
+
+    /** Handle a pointer-down that concerns an open (or to-be-opened) menu.
+     *  Returns true if the event was consumed by the menu. */
+    private function handleContextMenuPointer(float $x, float $y, int $button): bool
+    {
+        if ($this->contextMenus !== []) {
+            $hit = $this->hitContextMenu($x, $y);
+            if ($hit !== null) {
+                $menu = $this->contextMenus[$hit['id']];
+                $panel = $hit['depth'] === 0 ? $menu : $menu['submenus'][$hit['depth'] - 1];
+                $item = $panel['items'][$hit['index']] ?? null;
+                if (is_array($item) && (isset($item['action']) || isset($item['msg']))) {
+                    $this->runContextMenuItem($hit['id'], $hit['index'], $hit['depth']);
+                    unset($this->contextMenus[$hit['id']]);
+                    $this->requestRedraw();
+                    return true;
+                }
+                // A preview / submenu-parent row (or empty space within the menu)
+                // keeps it open.
+                return true;
+            }
+            // Click outside any open menu dismisses it; a right-click is consumed,
+            // a left-click falls through to the widgets underneath.
+            $this->closeContextMenus();
+            $this->requestRedraw();
+            return $button === self::MB_RIGHT;
+        }
+        if ($button === self::MB_RIGHT) {
+            $node = Layout::hitTest($this->layout, $x, $y);
+            if ($node !== null) {
+                $id = $node->el->prop('id');
+                if ($id !== null) {
+                    $sid = (string)$id;
+                    if (in_array($node->type, ['input', 'textarea', 'search'], true)) {
+                        $this->applyFocus($sid);
+                        $this->openContextMenu($sid, $x, $y, $this->editMenuItems());
+                    } elseif ($node->el->prop('contextMenu') !== null) {
+                        $this->openContextMenu($sid, $x, $y);
+                    }
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+
+    private function hitContextMenu(float $x, float $y): ?array
+    {
+        foreach ($this->contextMenus as $id => $menu) {
+            $panels = array_merge([$menu], $menu['submenus']);
+            for ($k = count($panels) - 1; $k >= 0; $k--) {
+                $p = $panels[$k];
+                if ($x >= $p['x'] && $x <= $p['x'] + $p['w']
+                    && $y >= $p['y'] && $y <= $p['y'] + $p['h']) {
+                    $idx = $this->rowIndexAt($p, $x, $y);
+                    if ($idx >= 0 && $idx < count($p['items'])) {
+                        return ['id' => $id, 'index' => $idx, 'depth' => $k];
+                    }
+                    return null;
+                }
+            }
+        }
+        return null;
+    }
+
+    private function runContextMenuItem(string $id, int $index, int $depth = 0): void
+    {
+        $menu = $this->contextMenus[$id] ?? null;
+        if ($menu === null) {
+            return;
+        }
+        $panel = $depth === 0 ? $menu : ($menu['submenus'][$depth - 1] ?? null);
+        if ($panel === null) {
+            return;
+        }
+        $item = $panel['items'][$index] ?? null;
+        if (!is_array($item)) {
+            return;
+        }
+        if (isset($item['action'])) {
+            $this->runEditAction($id, (string)$item['action']);
+        } elseif (isset($item['msg'])) {
+            ($this->dispatch)((string)$item['msg']);
+        }
+    }
+
+    private function runEditAction(string $id, string $action): void
+    {
+        switch ($action) {
+            case 'undo':      $this->undoEdit($id); break;
+            case 'redo':      $this->redoEdit($id); break;
+            case 'cut':       $this->cut($id); break;
+            case 'copy':      $this->copy($id); break;
+            case 'paste':     $this->paste($id); break;
+            case 'selectAll': $this->selectAll($id); break;
+        }
+    }
+
+    /** Built-in edit menu for text fields (Undo/Redo/Cut/Copy/Paste/Select All). */
+    private function editMenuItems(): array
+    {
+        return [
+            ['title' => 'Clipboard', 'preview' => 'clipboard'],
+            ['title' => 'Undo',       'action' => 'undo'],
+            ['title' => 'Redo',       'action' => 'redo'],
+            ['title' => 'Cut',        'action' => 'cut'],
+            ['title' => 'Copy',       'action' => 'copy'],
+            ['title' => 'Paste',      'action' => 'paste'],
+            ['title' => 'Select All', 'action' => 'selectAll'],
+        ];
+    }
+
+    private function drawContextMenu($cr, array $menu): void
+    {
+        $this->drawMenu($cr, $menu, $menu['hover'] ?? -1);
+        foreach ($menu['submenus'] as $sub) {
+            $this->drawMenu($cr, $sub, $sub['hover'] ?? -1);
+        }
+    }
+
+    private function drawMenu($cr, array $menu, int $hover): void
+    {
+        $x = $menu['x'];
+        $y = $menu['y'];
+        $w = $menu['w'];
+        $h = $menu['h'];
+        Cairo::fillRect($cr, $x, $y, $w, $h, ...$this->col('surface'));
+        Cairo::strokeRect($cr, $x, $y, $w, $h, ...$this->col('border'));
+        $hasGutter = false;
+        foreach ($menu['items'] as $it) {
+            if (isset($it['icon']) || isset($it['checked'])) {
+                $hasGutter = true;
+                break;
+            }
+        }
+        $gutter = $hasGutter ? 22 : 0;
+        $titleX = $x + 12 + $gutter;
+        foreach ($menu['items'] as $i => $it) {
+            $ry = $y + self::MENU_PAD + $i * self::MENU_ROW_H;
+            if ($i === $hover) {
+                Cairo::fillRect($cr, $x, $ry, $w, self::MENU_ROW_H, ...$this->col('accentSoft'));
+            }
+            if ($gutter > 0) {
+                if (isset($it['checked']) && $it['checked']) {
+                    Cairo::text($cr, $x + 10, $ry + self::MENU_ROW_H - 8, '✓', 13, ...$this->col('text'));
+                } elseif (isset($it['icon'])) {
+                    Cairo::text($cr, $x + 10, $ry + self::MENU_ROW_H - 8, (string)$it['icon'], 13, ...$this->col('text'));
+                }
+            }
+            $title = (string)($it['title'] ?? '');
+            if (isset($it['preview']) && $it['preview'] === 'clipboard') {
+                $pv = $this->menuPreviewText($it);
+                Cairo::text($cr, $titleX, $ry + self::MENU_ROW_H - 8, $title, 13, ...$this->col('text'));
+                if ($pv !== null) {
+                    $tw = mb_strlen($title) * 7;
+                    $avail = (int)($w - $gutter - $tw - 12 - 8 - 16);
+                    $label = '“' . $pv . '”';
+                    $maxChars = max(1, (int)($avail / 7));
+                    if (mb_strlen($label) > $maxChars) {
+                        $label = mb_substr($label, 0, $maxChars) . '…';
+                    }
+                    Cairo::text($cr, $titleX + $tw + 8, $ry + self::MENU_ROW_H - 8, $label, 11, ...$this->col('textMuted'));
+                }
+                continue;
+            }
+            Cairo::text($cr, $titleX, $ry + self::MENU_ROW_H - 8, $title, 13, ...$this->col('text'));
+            if (isset($it['submenu'])) {
+                Cairo::text($cr, $x + $w - 16, $ry + self::MENU_ROW_H - 8, '›', 13, ...$this->col('textMuted'));
+            }
+        }
+    }
+
     public function dispatchGesture(string $id, string $type): void
     {
         $node = $this->findNodeById($id);
@@ -378,9 +837,9 @@ final class Canvas implements Backend
     }
 
     /** Inject a pointer event (headless automation). */
-    public function injectPointer(float $x, float $y, bool $down): void
+    public function injectPointer(float $x, float $y, bool $down, int $button = self::MB_LEFT): void
     {
-        Phpc::call($this->ffi, 'ui3_host_inject_pointer', [$this->host, $x, $y, $down ? 1 : 0]);
+        Phpc::call($this->ffi, 'ui3_host_inject_pointer', [$this->host, $x, $y, $down ? 1 : 0, $button]);
     }
 
     /** Inject a keystroke (headless automation). Routes to the focused field. */
@@ -423,7 +882,7 @@ final class Canvas implements Backend
     /** Reset a field's edit buffer to empty (used by input() to set a value). */
     public function resetField(string $id): void
     {
-        $this->fields[$id] = ['text' => '', 'cursor' => 0];
+        $this->fields[$id] = ['text' => '', 'cursor' => 0, 'sel' => 0, 'undo' => [], 'redo' => []];
     }
 
     /**
@@ -444,6 +903,9 @@ final class Canvas implements Backend
         $this->seedField($id);
         $this->fields[$id]['text'] = $text;
         $this->fields[$id]['cursor'] = mb_strlen($text);
+        $this->fields[$id]['sel'] = mb_strlen($text);
+        $this->fields[$id]['undo'] = [];
+        $this->fields[$id]['redo'] = [];
         $h = $node->el->prop('onInput');
         if (is_string($h) && $h !== '' && $this->dispatch !== null) {
             ($this->dispatch)($h, $text);
@@ -474,6 +936,201 @@ final class Canvas implements Backend
     {
         $node = $this->findNodeById($id);
         return $node === null ? '' : $this->displayTextFor($node);
+    }
+
+    /** [start, end] character range currently selected (start <= end). */
+    public function fieldSelectionRange(string $id): array
+    {
+        $this->seedField($id);
+        $b = $this->fields[$id];
+        return [min($b['cursor'], $b['sel']), max($b['cursor'], $b['sel'])];
+    }
+
+    /** Native clipboard is reachable only for a real (displayed) window. */
+    private function nativeClipboard(): bool
+    {
+        return $this->host !== null && !$this->isHeadless();
+    }
+
+    /** Read a C char* return into a PHP string (null-safe for cancelled dialogs). */
+    private function cstr(mixed $ptr): string
+    {
+        if ($ptr === null) {
+            return '';
+        }
+        if ($ptr instanceof \FFI\CData) {
+            return \FFI::isNull($ptr) ? '' : \FFI::string($ptr);
+        }
+        return (string)$ptr;
+    }
+
+    public function clipboard(): string
+    {
+        if ($this->nativeClipboard()) {
+            try {
+                $this->clipboard = $this->cstr(
+                    Phpc::call($this->ffi, 'ui3_host_get_clipboard_text', [$this->host])
+                );
+            } catch (\Throwable) {
+                // keep the in-memory mirror
+            }
+        }
+        return $this->clipboard;
+    }
+
+    public function setClipboard(string $s): void
+    {
+        $this->clipboard = $s;
+        if ($this->nativeClipboard()) {
+            try {
+                Phpc::call($this->ffi, 'ui3_host_set_clipboard_text', [$this->host, $s]);
+            } catch (\Throwable) {
+                // in-memory mirror already updated
+            }
+        }
+    }
+
+    /**
+     * Open a native file chooser. Returns the chosen path, or null if the dialog
+     * is unavailable (headless) or was cancelled.
+     *
+     * @param string|null $filters Filter spec: "png,jpg" or
+     *     "Images:png,jpg;Text:txt,md" (labeled groups; leading dots optional).
+     *     An "All Files" entry is always appended.
+     */
+    public function openFile(?string $filters = null): ?string
+    {
+        if ($this->host === null || $this->isHeadless()) {
+            return null;
+        }
+        try {
+            $path = $this->cstr(Phpc::call($this->ffi, 'ui3_host_open_file', [$this->host, $filters ?? '']));
+        } catch (\Throwable) {
+            return null;
+        }
+        return $path === '' ? null : $path;
+    }
+
+    /**
+     * Open a native save dialog. Returns the chosen path, or null if unavailable
+     * (headless) or cancelled.
+     *
+     * @param string|null $defext Default extension (e.g. "png"), used for the
+     *     dialog filter and the default name "untitled.<defext>".
+     */
+    public function saveFile(?string $defext = null): ?string
+    {
+        if ($this->host === null || $this->isHeadless()) {
+            return null;
+        }
+        try {
+            $path = $this->cstr(Phpc::call($this->ffi, 'ui3_host_save_file', [$this->host, $defext ?? '']));
+        } catch (\Throwable) {
+            return null;
+        }
+        return $path === '' ? null : $path;
+    }
+
+    /** Cut the current selection of a field (defaults to the focused field) to the clipboard. */
+    public function cut(?string $id = null): void
+    {
+        $id ??= $this->focusId ?? '';
+        if ($id === '') {
+            return;
+        }
+        $node = $this->findNodeById($id);
+        if ($node === null) {
+            return;
+        }
+        $this->seedField($id);
+        $buf = &$this->fields[$id];
+        if ($buf['sel'] === $buf['cursor']) {
+            return;
+        }
+        $this->setClipboard(mb_substr($buf['text'], min($buf['cursor'], $buf['sel']), abs($buf['cursor'] - $buf['sel'])));
+        $this->pushUndo($buf);
+        $this->deleteSelection($buf);
+        $this->emitInput($node, $buf);
+    }
+
+    /** Copy the current selection of a field to the clipboard. */
+    public function copy(?string $id = null): void
+    {
+        $id ??= $this->focusId ?? '';
+        if ($id === '') {
+            return;
+        }
+        $this->seedField($id);
+        $buf = $this->fields[$id];
+        if ($buf['sel'] === $buf['cursor']) {
+            return;
+        }
+        $this->setClipboard(mb_substr($buf['text'], min($buf['cursor'], $buf['sel']), abs($buf['cursor'] - $buf['sel'])));
+    }
+
+    /** Paste the clipboard contents over the selection (or at the caret) of a field. */
+    public function paste(?string $id = null): void
+    {
+        $id ??= $this->focusId ?? '';
+        $text = $this->clipboard();
+        if ($id === '' || $text === '') {
+            return;
+        }
+        $node = $this->findNodeById($id);
+        if ($node === null) {
+            return;
+        }
+        $this->seedField($id);
+        $buf = &$this->fields[$id];
+        $this->pushUndo($buf);
+        $this->replaceSelection($buf, $text);
+        $this->emitInput($node, $buf);
+    }
+
+    /** Select the entire contents of a field. */
+    public function selectAll(?string $id = null): void
+    {
+        $id ??= $this->focusId ?? '';
+        if ($id === '') {
+            return;
+        }
+        $this->seedField($id);
+        $buf = &$this->fields[$id];
+        $buf['sel'] = 0;
+        $buf['cursor'] = mb_strlen($buf['text']);
+        $this->requestRedraw();
+    }
+
+    public function undoEdit(?string $id = null): void
+    {
+        $id ??= $this->focusId ?? '';
+        if ($id === '') {
+            return;
+        }
+        $node = $this->findNodeById($id);
+        if ($node === null) {
+            return;
+        }
+        $this->seedField($id);
+        $buf = &$this->fields[$id];
+        $this->doUndo($buf);
+        $this->emitInput($node, $buf);
+    }
+
+    public function redoEdit(?string $id = null): void
+    {
+        $id ??= $this->focusId ?? '';
+        if ($id === '') {
+            return;
+        }
+        $node = $this->findNodeById($id);
+        if ($node === null) {
+            return;
+        }
+        $this->seedField($id);
+        $buf = &$this->fields[$id];
+        $this->doRedo($buf);
+        $this->emitInput($node, $buf);
     }
 
     /** Visible text for a field node: edit buffer > element value > placeholder. */
@@ -603,6 +1260,10 @@ final class Canvas implements Backend
             $sid = (string) $id;
             $this->paintScrollbar($cr, $n, Layout::scrollContentHeight($sid), $this->effectiveScrollOffset($sid));
         }
+        // Context menus drawn last so they overlay everything else.
+        foreach ($this->contextMenus as $menu) {
+            $this->drawContextMenu($cr, $menu);
+        }
         // Keep the native frame loop alive while animations or scroll physics
         // (rubber-band / scrollbar fade) are still in flight.
         $scrollAnimating = $this->scrollElastic !== []
@@ -631,6 +1292,11 @@ final class Canvas implements Backend
             return;
         }
         // Drag (MOVE/UP) is driven by the in-progress drag, not by hit-testing.
+        if ($kind === self::POINTER_MOVE && $this->contextMenus !== []) {
+            $this->updateMenuHover($x, $y);
+            return;
+        }
+
         if ($kind === self::POINTER_MOVE || $kind === self::POINTER_UP) {
             // Native overlay scrollbars reveal on hover over a scroll container.
             if ($kind === self::POINTER_MOVE) {
@@ -644,6 +1310,9 @@ final class Canvas implements Backend
             return;
         }
         if ($kind !== self::POINTER_DOWN) {
+            return;
+        }
+        if ($this->handleContextMenuPointer($x, $y, (int)$data)) {
             return;
         }
         // An expanded dropdown captures clicks inside its popup.
@@ -715,8 +1384,13 @@ final class Canvas implements Backend
             $this->scrollBy($this->activeScrollId, $text === self::KEY_DOWN ? 40 : -40);
             return;
         }
-        // Escape closes any expanded dropdown.
+        // Escape closes any open context menu first, then expanded dropdowns.
         if ($text === self::KEY_ESC) {
+            if ($this->contextMenus !== []) {
+                $this->closeContextMenus();
+                $this->requestRedraw();
+                return;
+            }
             $changed = false;
             foreach ($this->expanded as $eid => $on) {
                 if ($on) {
@@ -763,43 +1437,260 @@ final class Canvas implements Backend
     /** Edit a text control: maintain the per-field buffer (see #5a). */
     private function editText(Node $node, string $text): void
     {
-        $id = (string) $node->el->prop('id');
+        $id = (string) $node->el->prop('id', '');
         $this->seedField($id);
         $buf = &$this->fields[$id];
-        $t = $buf['text'];
-        $c = $buf['cursor'];
 
-        if ($text === self::KEY_LEFT) {
-            $buf['cursor'] = $c > 0 ? $c - 1 : 0;
-            return;
-        }
-        if ($text === self::KEY_RIGHT) {
-            $buf['cursor'] = $c < mb_strlen($t) ? $c + 1 : $c;
-            return;
-        }
-        // Arrow Up/Down only browse list/select; a text field ignores them.
-        if ($text === self::KEY_UP || $text === self::KEY_DOWN) {
-            return;
-        }
-        if ($text === "\x08") {          // backspace: delete before cursor
-            if ($c <= 0) {
+        // ---- Ctrl+ shortcuts (host emits "Ctrl+<key>" on macOS; see P0.1) ----
+        if (str_starts_with($text, 'Ctrl+')) {
+            $lower = strtolower(substr($text, 5));
+            if ($lower === 'a') {                 // select all
+                $buf['sel'] = 0;
+                $buf['cursor'] = mb_strlen($buf['text']);
+                $this->requestRedraw();
                 return;
             }
-            $t = mb_substr($t, 0, $c - 1) . mb_substr($t, $c);
-            $c--;
-        } elseif (mb_strlen($text) === 1) { // a printable keystroke
-            $t = mb_substr($t, 0, $c) . $text . mb_substr($t, $c);
-            $c++;
-        } else {
-            return; // not a single keystroke
+            if ($lower === 'c') {                 // copy
+                if ($buf['sel'] !== $buf['cursor']) {
+                    $this->setClipboard(mb_substr($buf['text'], min($buf['cursor'], $buf['sel']), abs($buf['cursor'] - $buf['sel'])));
+                }
+                return;
+            }
+            if ($lower === 'x') {                 // cut
+                if ($buf['sel'] !== $buf['cursor']) {
+                    $this->setClipboard(mb_substr($buf['text'], min($buf['cursor'], $buf['sel']), abs($buf['cursor'] - $buf['sel'])));
+                    $this->pushUndo($buf);
+                    $this->deleteSelection($buf);
+                    $this->emitInput($node, $buf);
+                }
+                return;
+            }
+            if ($lower === 'v') {                 // paste
+                if ($this->clipboard !== '') {
+                    $this->pushUndo($buf);
+                    $this->replaceSelection($buf, $this->clipboard);
+                    $this->emitInput($node, $buf);
+                }
+                return;
+            }
+            if ($lower === 'z') {                 // undo
+                $this->doUndo($buf);
+                $this->emitInput($node, $buf);
+                return;
+            }
+            if ($lower === 'y' || $lower === 'shift+z') { // redo
+                $this->doRedo($buf);
+                $this->emitInput($node, $buf);
+                return;
+            }
+            return; // unknown Ctrl combo: ignore
         }
-        $buf['text'] = $t;
-        $buf['cursor'] = $c;
 
-        // Emit the new full value — exactly what a real text control does.
+        $len = mb_strlen($buf['text']);
+        $c = $buf['cursor'];
+        switch ($text) {
+            case self::KEY_LEFT:
+                $buf['cursor'] = max(0, $c - 1);
+                $buf['sel'] = $buf['cursor'];
+                break;
+            case self::KEY_RIGHT:
+                $buf['cursor'] = min($len, $c + 1);
+                $buf['sel'] = $buf['cursor'];
+                break;
+            case self::KEY_SHIFT_LEFT:
+                $buf['cursor'] = max(0, $c - 1);
+                break;
+            case self::KEY_SHIFT_RIGHT:
+                $buf['cursor'] = min($len, $c + 1);
+                break;
+            case self::KEY_HOME:
+                $buf['cursor'] = 0;
+                $buf['sel'] = 0;
+                break;
+            case self::KEY_END:
+                $buf['cursor'] = $len;
+                $buf['sel'] = $len;
+                break;
+            case self::KEY_DEL:
+                $this->pushUndo($buf);
+                $this->deleteAt($buf, false);
+                $this->emitInput($node, $buf);
+                break;
+            case "\x08":                        // Backspace
+                $this->pushUndo($buf);
+                $this->deleteAt($buf, true);
+                $this->emitInput($node, $buf);
+                break;
+            default:
+                $ins = mb_strlen($text);
+                if ($ins >= 1 && $text !== "\r" && ord($text[0]) >= 0x20
+                    && ($text !== "\n" || $node->type === 'textarea')) {
+                    $this->pushUndo($buf);
+                    if ($buf['sel'] !== $buf['cursor']) {
+                        $this->deleteSelection($buf);
+                    }
+                    $pos = $buf['cursor'];
+                    $buf['text'] = mb_substr($buf['text'], 0, $pos) . $text . mb_substr($buf['text'], $pos);
+                    $buf['cursor'] = $pos + mb_strlen($text);
+                    $buf['sel'] = $buf['cursor'];
+                    $this->emitInput($node, $buf);
+                }
+                break;
+        }
+        $this->requestRedraw();
+    }
+
+    private function pushUndo(array &$buf): void
+    {
+        $buf['undo'][] = ['text' => $buf['text'], 'cursor' => $buf['cursor'], 'sel' => $buf['sel']];
+        if (count($buf['undo']) > 200) {
+            array_shift($buf['undo']);
+        }
+        $buf['redo'] = [];
+    }
+
+    private function doUndo(array &$buf): void
+    {
+        if ($buf['undo'] === []) {
+            return;
+        }
+        $buf['redo'][] = ['text' => $buf['text'], 'cursor' => $buf['cursor'], 'sel' => $buf['sel']];
+        $prev = array_pop($buf['undo']);
+        $buf['text'] = $prev['text'];
+        $buf['cursor'] = $prev['cursor'];
+        $buf['sel'] = $prev['sel'];
+    }
+
+    private function doRedo(array &$buf): void
+    {
+        if ($buf['redo'] === []) {
+            return;
+        }
+        $buf['undo'][] = ['text' => $buf['text'], 'cursor' => $buf['cursor'], 'sel' => $buf['sel']];
+        $next = array_pop($buf['redo']);
+        $buf['text'] = $next['text'];
+        $buf['cursor'] = $next['cursor'];
+        $buf['sel'] = $next['sel'];
+    }
+
+    private function deleteSelection(array &$buf): void
+    {
+        $c = $buf['cursor'];
+        $s = $buf['sel'];
+        if ($c === $s) {
+            return;
+        }
+        [$a, $b] = $c < $s ? [$c, $s] : [$s, $c];
+        $buf['text'] = mb_substr($buf['text'], 0, $a) . mb_substr($buf['text'], $b);
+        $buf['cursor'] = $a;
+        $buf['sel'] = $a;
+    }
+
+    private function deleteAt(array &$buf, bool $backward): void
+    {
+        $c = $buf['cursor'];
+        $s = $buf['sel'];
+        if ($s !== $c) {
+            $this->deleteSelection($buf);
+            return;
+        }
+        $len = mb_strlen($buf['text']);
+        if ($backward) {
+            if ($c > 0) {
+                $buf['text'] = mb_substr($buf['text'], 0, $c - 1) . mb_substr($buf['text'], $c);
+                $buf['cursor'] = $c - 1;
+                $buf['sel'] = $c - 1;
+            }
+        } elseif ($c < $len) {
+            $buf['text'] = mb_substr($buf['text'], 0, $c) . mb_substr($buf['text'], $c + 1);
+            $buf['sel'] = $c;
+        }
+    }
+
+    private function replaceSelection(array &$buf, string $ins): void
+    {
+        if ($buf['sel'] !== $buf['cursor']) {
+            $this->deleteSelection($buf);
+        }
+        $pos = $buf['cursor'];
+        $buf['text'] = mb_substr($buf['text'], 0, $pos) . $ins . mb_substr($buf['text'], $pos);
+        $buf['cursor'] = $pos + mb_strlen($ins);
+        $buf['sel'] = $buf['cursor'];
+    }
+
+    private function emitInput(Node $node, array $buf): void
+    {
         $h = $node->el->prop('onInput');
-        if (is_string($h) && $h !== '') {
-            ($this->dispatch)($h, $t);
+        if (is_string($h) && $h !== '' && $this->dispatch !== null) {
+            ($this->dispatch)($h, $buf['text']);
+        }
+        $this->requestRedraw();
+    }
+
+    private function caretVisible(): bool
+    {
+        return ((int) ($this->now() * 2)) % 2 === 0;
+    }
+
+    /** Draw an input/textarea/search field's text, selection highlight and blinking caret. */
+    private function drawFieldText($cr, Node $n, float $x, float $y, float $w, float $h, int $padX): void
+    {
+        $id = (string) $n->el->prop('id', '');
+        $buf = $this->fields[$id] ?? null;
+        $text = $buf !== null ? $buf['text'] : (string) $n->el->prop('text', '');
+        if ($n->el->prop('password')) {
+            $text = str_repeat('•', mb_strlen($text));
+        }
+        $show = $text !== '' ? $text : (string) $n->el->prop('placeholder', '');
+        $tc = $text !== '' ? $this->col('text') : $this->col('textMuted');
+
+        Cairo::save($cr);
+        Cairo::clip($cr, $x - 2, $y - 2, $w + 4, $h + 4);
+        if ($buf !== null && $buf['sel'] !== $buf['cursor']) {
+            $this->drawFieldSelection($cr, $text, $buf['sel'], $buf['cursor'], $x, $y, $padX);
+        }
+        Cairo::text($cr, $x, $y + 12, $show, 13, $tc[0], $tc[1], $tc[2]);
+        if ($buf !== null) {
+            $this->drawComposition($cr, $n->el, $text, $x, $y + 12, $w);
+        }
+        if ($buf !== null && $this->caretVisible()) {
+            [$cx, $cy] = $this->fieldCaretXY($cr, $text, $buf['cursor'], $x, $y, $padX);
+            Cairo::fillRect($cr, $cx, $cy, 1.2, 16, $tc[0], $tc[1], $tc[2]);
+        }
+        Cairo::restore($cr);
+    }
+
+    private function fieldCaretXY($cr, string $text, int $pos, float $x, float $y, int $padX): array
+    {
+        $lines = explode("\n", mb_substr($text, 0, $pos));
+        $i = count($lines) - 1;
+        $lineStr = $lines[$i];
+        $cx = $x + (float) Cairo::textExtents($cr, $lineStr)['w'];
+        $cy = $y + 2 + $i * 18;
+        return [$cx, $cy];
+    }
+
+    private function drawFieldSelection($cr, string $text, int $sel, int $cur, float $x, float $y, int $padX): void
+    {
+        if ($cur === $sel) {
+            return;
+        }
+        [$a, $b] = $cur < $sel ? [$cur, $sel] : [$sel, $cur];
+        $lineH = 18;
+        $lines = explode("\n", $text);
+        $pos = 0;
+        $col = $this->col('selected');
+        foreach ($lines as $i => $line) {
+            $lineStart = $pos;
+            $lineEnd = $pos + mb_strlen($line);
+            $segA = max($a, $lineStart);
+            $segB = min($b, $lineEnd);
+            if ($segA < $segB) {
+                $xa = $x + (float) Cairo::textExtents($cr, mb_substr($line, 0, $segA - $lineStart))['w'];
+                $xb = $x + (float) Cairo::textExtents($cr, mb_substr($line, 0, $segB - $lineStart))['w'];
+                Cairo::fillRect($cr, $xa, $y + 2 + $i * $lineH, $xb - $xa, $lineH - 4, $col[0], $col[1], $col[2]);
+            }
+            $pos = $lineEnd + 1;
         }
     }
 
@@ -855,7 +1746,13 @@ final class Canvas implements Backend
                 break;
             }
         }
-        $this->fields[$id] = ['text' => $text, 'cursor' => mb_strlen($text)];
+        $this->fields[$id] = [
+            'text' => $text,
+            'cursor' => mb_strlen($text),
+            'sel' => mb_strlen($text),
+            'undo' => [],
+            'redo' => [],
+        ];
     }
 
     /** Seed a list/select highlight from its current value. */
@@ -1186,11 +2083,7 @@ final class Canvas implements Backend
             case 'textarea':
                 Cairo::fillRect($cr, $x, $y, $w, $h, ...$this->col('surface'));
                 Cairo::strokeRect($cr, $x, $y, $w, $h, ...$this->col('border'));
-                $show = $this->displayTextFor($n);
-                $tc = $show !== '' && $show !== (string) $el->prop('placeholder', '')
-                    ? $this->col('text') : $this->col('textMuted');
-                Cairo::text($cr, $x + 6, $y + 16, $show, 13, ...$tc);
-                $this->drawComposition($cr, $el, $show, $x + 6, $y + 16, $w - 10);
+                $this->drawFieldText($cr, $n, $x + 6, $y + 4, $w - 12, $h - 8, 0);
                 break;
             case 'checkbox':
             case 'radio':
@@ -1524,12 +2417,23 @@ final class Canvas implements Backend
         Cairo::fillRect($cr, $x, $y, $w, $h, ...$this->col('surface'));
         Cairo::strokeRect($cr, $x, $y, $w, $h, ...$this->col('border'));
         Cairo::text($cr, $x + 8, $y + $h / 2 + 4, '🔍', 13, ...$this->col('textMuted'));
-        $txt = (string) $el->prop('text', '');
-        $showPlaceholder = $txt === '' && ((string) ($el->prop('id') ?? '') !== $this->focusId);
+        $id = (string) $el->prop('id', '');
+        $buf = $this->fields[$id] ?? null;
+        $text = $buf !== null ? $buf['text'] : (string) $el->prop('text', '');
+        $showPlaceholder = $text === '' && $id !== $this->focusId;
         $tc = $this->col($showPlaceholder ? 'textMuted' : 'text');
-        Cairo::text($cr, $x + 28, $y + $h / 2 + 4, $showPlaceholder ? (string) $el->prop('placeholder', '') : $txt, 13, ...$tc);
-        if (!$showPlaceholder) {
-            $this->drawComposition($cr, $el, $txt, $x + 28, $y + $h / 2 + 4, $w - 34);
+        $tx = $x + 28;
+        $ty = $y + $h / 2 + 4;
+        Cairo::text($cr, $tx, $ty, $showPlaceholder ? (string) $el->prop('placeholder', '') : $text, 13, ...$tc);
+        if ($buf !== null) {
+            if ($buf['sel'] !== $buf['cursor']) {
+                $this->drawFieldSelection($cr, $text, $buf['sel'], $buf['cursor'], $tx, $ty - 12, 0);
+            }
+            $this->drawComposition($cr, $el, $text, $tx, $ty, $w - 34);
+            if ($this->caretVisible()) {
+                [$cx, $cy] = $this->fieldCaretXY($cr, $text, $buf['cursor'], $tx, $ty - 12, 0);
+                Cairo::fillRect($cr, $cx, $cy, 1.2, 16, ...$this->col('text'));
+            }
         }
     }
 

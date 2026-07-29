@@ -49,4 +49,41 @@ final class Animation
             default => $t,
         };
     }
+
+    /**
+     * Interpolate one element's animation spec at $elapsedMs. Backend-agnostic:
+     * the Canvas host and the headless Reference renderer both call this so the
+     * interpolation math lives in exactly one place. Returns the same shape
+     * Canvas stored in $animStates: ['alpha','dx','dy','scale','done'].
+     */
+    public static function frame(array $spec, float $elapsedMs): array
+    {
+        $dx = 0.0; $dy = 0.0; $scale = 1.0; $alpha = 1.0; $done = true;
+        foreach ($spec as $s) {
+            $dur = (float)($s['duration'] ?? 1000);
+            $delay = (float)($s['delay'] ?? 0);
+            $p = self::progress($elapsedMs, $dur, $delay);
+            if ($p < 1.0) {
+                $done = false;
+            }
+            $e = self::ease((string)($s['easing'] ?? 'linear'), $p);
+            $from = (float)($s['from'] ?? 0);
+            $to = (float)($s['to'] ?? 1);
+            $v = $from + ($to - $from) * $e;
+            switch ($s['key'] ?? 'opacity') {
+                case 'x':
+                    $dx = $v;
+                    break;
+                case 'y':
+                    $dy = $v;
+                    break;
+                case 'scale':
+                    $scale = $v;
+                    break;
+                default:
+                    $alpha = $v;
+            }
+        }
+        return ['alpha' => $alpha, 'dx' => $dx, 'dy' => $dy, 'scale' => $scale, 'done' => $done];
+    }
 }

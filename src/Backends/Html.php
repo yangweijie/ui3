@@ -22,6 +22,10 @@ final class Html implements Backend
     private string $html = '';
     private array $theme = [];
 
+    /** @var list<string> CSS @keyframes blocks accumulated during a render */
+    private array $animKeyframes = [];
+    private int $animSeq = 0;
+
     public function __construct(private string|array $themeName = Theme::LIGHT)
     {
         $this->theme = Theme::get($themeName);
@@ -82,10 +86,14 @@ final class Html implements Backend
             $this->html = '';
             return;
         }
+        $this->animKeyframes = [];
+        $this->animSeq = 0;
         $bg = $this->css($this->theme['bg'] ?? [1, 1, 1]);
         $fg = $this->css($this->theme['text'] ?? [0, 0, 0]);
+        $body = $this->renderNode($this->root);
+        $style = $this->animKeyframes !== [] ? '<style>' . implode('', $this->animKeyframes) . '</style>' : '';
         $this->html = '<div class="ui3-root" style="background:' . $bg . ';color:' . $fg . '">'
-            . $this->renderNode($this->root) . '</div>';
+            . $body . '</div>' . $style;
     }
 
     private function renderNode(Element $el, int $depth = 0): string
@@ -99,6 +107,45 @@ final class Html implements Backend
             . ($id !== null ? ' data-id="' . $this->esc((string) $id) . '"' : '')
             . ($el->prop('label') !== null ? ' data-label="' . $this->esc((string) $el->prop('label')) . '"' : '')
             . ($el->prop('description') !== null ? ' data-description="' . $this->esc((string) $el->prop('description')) . '"' : '');
+
+        // Animation: emit CSS @keyframes + an `animation` style so the browser
+        // drives opacity/translate/scale with no JS runtime and no FFI.
+        $anim = $el->prop('anim');
+        if (is_array($anim) && $anim !== []) {
+            $this->animSeq++;
+            $name = 'ui3-a' . $this->animSeq;
+            $o = [1.0, 1.0];
+            $xv = [0.0, 0.0];
+            $yv = [0.0, 0.0];
+            $sc = [1.0, 1.0];
+            $dur = 0.0;
+            $delay = 0;
+            $easing = 'linear';
+            foreach ($anim as $s) {
+                $f = (float) ($s['from'] ?? 0);
+                $t = (float) ($s['to'] ?? 1);
+                $dur = max($dur, (float) ($s['duration'] ?? 1000));
+                $delay = max($delay, (float) ($s['delay'] ?? 0));
+                $easing = (string) ($s['easing'] ?? $easing);
+                switch ($s['key'] ?? 'opacity') {
+                    case 'x':
+                        $xv = [$f, $t];
+                        break;
+                    case 'y':
+                        $yv = [$f, $t];
+                        break;
+                    case 'scale':
+                        $sc = [$f, $t];
+                        break;
+                    default:
+                        $o = [$f, $t];
+                }
+            }
+            $from = 'from{opacity:' . $o[0] . ';transform:translate(' . $xv[0] . 'px,' . $yv[0] . 'px) scale(' . $sc[0] . ')}';
+            $to = 'to{opacity:' . $o[1] . ';transform:translate(' . $xv[1] . 'px,' . $yv[1] . 'px) scale(' . $sc[1] . ')}';
+            $this->animKeyframes[] = '@keyframes ' . $name . '{' . $from . $to . '}';
+            $attrs .= ' style="animation:' . $name . ' ' . $dur . 'ms ' . $easing . ' ' . $delay . 'ms both;" data-anim="1"';
+        }
 
         $tag = $this->tagFor((string) $el->type);
         $selfClosing = $tag === 'input';

@@ -65,6 +65,17 @@ static LRESULT CALLBACK win32_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 host->event_cb(host->event_ctx, UI3_EVENT_POINTER_UP,
                                (double)GET_X_LPARAM(lParam), (double)GET_Y_LPARAM(lParam), 0, NULL);
             return 0;
+        case WM_MOUSEWHEEL: {
+            if (host->event_cb) {
+                POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+                ScreenToClient(hwnd, &pt);
+                // data > 0 == scroll down. Win32 reports up as positive, so negate.
+                double dy = -(double)GET_WHEEL_DELTA_WPARAM(wParam) / (double)WHEEL_DELTA * 40.0;
+                host->event_cb(host->event_ctx, UI3_EVENT_WHEEL,
+                               (double)pt.x, (double)pt.y, dy, NULL);
+            }
+            return 0;
+        }
         case WM_MOUSEMOVE:
             if (host->event_cb)
                 host->event_cb(host->event_ctx, UI3_EVENT_POINTER_MOVE,
@@ -153,6 +164,13 @@ int ui3_plat_create_window(ui3_host *host, const char *title)
 }
 
 void ui3_plat_request_redraw(ui3_host *host)
+{
+    win32_plat *p = host->plat;
+    if (!p || !p->hwnd) return;
+    InvalidateRect(p->hwnd, NULL, FALSE);
+}
+
+void ui3_plat_present(ui3_host *host)
 {
     win32_plat *p = host->plat;
     if (!p || !p->hwnd) return;

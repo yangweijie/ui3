@@ -67,7 +67,8 @@ test('scrollBy moves list and scroll widgets and dispatches onScroll', function 
     expect($canvas->scrollOffset('lst'))->toBe(0);
 
     $canvas->scrollBy('scr', 10);
-    expect($canvas->scrollOffset('scr'))->toBe(10);
+    // 'scr' content fits its viewport (maxOff = 0), so scrolling clamps to 0.
+    expect($canvas->scrollOffset('scr'))->toBe(0);
 });
 
 test('context menu opens, exposes items, and closes', function () {

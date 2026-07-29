@@ -80,11 +80,24 @@ static void cocoa_paint(ui3_host *host, CGContextRef cg)
 
 - (void)mouseDown:(NSEvent *)e { [self forwardEvent:e down:1]; }
 - (void)mouseUp:(NSEvent *)e   { [self forwardEvent:e down:0]; }
-- (void)mouseMoved:(NSEvent *)e {
+- (void)forwardMove:(NSEvent *)e {
     ui3_host *host = self.host;
     if (!host || !host->event_cb) return;
     NSPoint p = [self convertPoint:[e locationInWindow] fromView:nil];
     host->event_cb(host->event_ctx, UI3_EVENT_POINTER_MOVE, p.x, p.y, 0, NULL);
+}
+/* NB: while a mouse button is held, Cocoa sends mouseDragged:, NOT mouseMoved:.
+ * Without this the thumb can't be dragged (no MOVE events arrive mid-drag). */
+- (void)mouseMoved:(NSEvent *)e  { [self forwardMove:e]; }
+- (void)mouseDragged:(NSEvent *)e { [self forwardMove:e]; }
+
+- (void)scrollWheel:(NSEvent *)e {
+    ui3_host *host = self.host;
+    if (!host || !host->event_cb) return;
+    NSPoint p = [self convertPoint:[e locationInWindow] fromView:nil];
+    // data > 0 == scroll down (viewport offset increases). Cocoa reports a
+    // downward physical scroll as a negative deltaY, so negate.
+    host->event_cb(host->event_ctx, UI3_EVENT_WHEEL, p.x, p.y, -[e scrollingDeltaY], NULL);
 }
 
 @end
@@ -152,6 +165,7 @@ int ui3_plat_create_window(ui3_host *host, const char *title)
         win.delegate = delegate;
 
         [win makeKeyAndOrderFront:nil];
+        [win setAcceptsMouseMovedEvents:YES]; /* let hover reveal the scrollbar */
         [app activateIgnoringOtherApps:YES];
 
         cocoa_plat *p = malloc(sizeof(*p));
@@ -166,7 +180,23 @@ int ui3_plat_create_window(ui3_host *host, const char *title)
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+/* ASYNC: schedule a redraw via the OS compositor. This must NOT paint
+ * synchronously, otherwise a draw callback that requests a redraw (e.g. an
+ * animation keeps the frame loop alive) re-enters paint() and overflows the
+ * stack. The OS calls drawRect on its own schedule, which is the proper
+ * vsync-aligned frame loop. */
 void ui3_plat_request_redraw(ui3_host *host)
+{
+    if (!host || !host->plat) return;
+    cocoa_plat *p = host->plat;
+    Ui3View *view = (__bridge Ui3View *)(p->view);
+    if (!view) return;
+    [view setNeedsDisplay:YES];
+}
+
+/* SYNC: paint one frame immediately into the current graphics context. Used by
+ * ui3_host_present() for the initial frame and explicit single-shot redraws. */
+void ui3_plat_present(ui3_host *host)
 {
     if (!host || !host->plat) return;
     cocoa_plat *p = host->plat;

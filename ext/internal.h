@@ -30,7 +30,8 @@ struct ui3_host {
 
 /* Platform hooks (cocoa.m / win32.c / x11.c). */
 int  ui3_plat_create_window(ui3_host *host, const char *title); /* 0 ok, -1 unsupported */
-void ui3_plat_request_redraw(ui3_host *host);
+void ui3_plat_request_redraw(ui3_host *host); /* ASYNC: schedule a redraw (no synchronous draw) */
+void ui3_plat_present(ui3_host *host);        /* SYNC: paint one frame immediately */
 int  ui3_plat_step(ui3_host *host);   /* pump one event batch; return host->running */
 void ui3_plat_run(ui3_host *host);
 void ui3_plat_destroy(ui3_host *host);

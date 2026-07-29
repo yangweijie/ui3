@@ -83,8 +83,62 @@
 - [x] 全部示例运行通过（headless / 纯 PHP）
 - Status: done
 
+### P0: 渲染底座 + 像素回归（成熟度提升）
+- [x] `src/Backends/Reference.php`：纯 PHP 参考渲染器（NullPlatform 等价），GD 栅格化 Element 树为 PNG，零 FFI/原生库
+- [x] `Layout::textWidth` 注入纯 PHP 文本测量（默认仍 Cairo），渲染后复位
+- [x] `tests/ReferenceRenderTest.php` + `tests/baselines/*.hash`：确定性 + 像素级回归（`UI3_UPDATE_BASELINE` 重建）
+- [x] `composer test:ref`：纯 PHP 跑参考测试，无需原生库
+- [x] `examples/reference.php`：纯 PHP 渲染 PNG 演示
+- Status: done
+
+### P1: 常驻动画 ticker + 文本精确测量/IME（成熟度提升）
+- [x] `src/Ticker.php`：常驻动画 ticker（独立于原生窗口的帧时钟，可注入时钟源，回调可提前停止）
+- [x] `src/Animation.php::frame()`：动画插值抽离为后端无关纯函数，Canvas 与 Reference 共用
+- [x] `src/Backends/Canvas.php`：drawNode 复用 `Animation::frame()`（行为不变）
+- [x] `src/Backends/Reference.php`：setClock/clock/resetClock/isAnimating/animState + 帧渲染（translate/scale + opacity 背景混合近似）
+- [x] 文本测量：`pureTextWidth` 改按字符类别累加（全角/半角/IME 组合），零依赖确定
+- [x] `tests/TickerTest.php` + `tests/ReferenceRenderTest.php`(动画帧)：ticker/frame/CJK-IME 测量/动画帧回归
+- [x] `examples/animated_reference.php`：纯 PHP ticker 驱动渲染多帧
+- Status: done
+
+### P2: Headless 应用循环 + IME 组合输入 + Reference 控件覆盖 + Html 动画（成熟度提升）
+- [x] `App::headless(frames, fps, durationSec, onFrame)`：`App::run()` 检测 headless 后端（Reference/Html）时用 `Ticker` 驱动逐帧 `setClock`+`update`；缓存渲染树避免动画起点每帧重置；`withClock()` 注入时钟源便于测试
+- [x] IME 组合输入：`Ui::input/textarea/searchField` 加 `onComposition` 钩子（第5参数，位于 `id` 之后）；`Reference::composition(id,phase,text)` 存状态并绘制待定文本+下划线预览；`App::composition(id,phase,text)` 注入 headless 后端并重绘
+- [x] `Reference` 控件覆盖：`case 'scroll'`（视口背景填充）与 `case 'table'`（列头+行），对齐 Canvas 绘制
+- [x] `Html` 后端动画：`renderNode` 检测 `anim` prop，纯 PHP 生成 CSS `@keyframes`+`animation` style（浏览器驱动，零 JS/FFI）
+- [x] `Reference::applyAlpha` 改用本地不透明背景色（修复 cross-image 颜色索引导致 opacity 无效）
+- [x] 参数顺序修复：`onComposition` 置于 `id` 之后，避免破坏既有 4 位置调用
+- [x] `tests/HeadlessLoopTest.php` / `tests/ImeTest.php` / `tests/ControlCoverageTest.php` / `tests/HtmlAnimTest.php`：headless 循环 / IME 预览 / scroll+table 覆盖 / Html 动画
+- Status: done
+
+### P3: Canvas IME 组合输入 parity + P2 能力可运行示例（成熟度提升）
+- [x] `Canvas` 增加 `$composition` 状态与 `composition(id, phase, text)` 方法（触发 `requestRedraw`），`input`/`textarea`/`drawSearch` 绘制待定文本（accent 色）+ 下划线预览，与 Reference headless 同构
+- [x] `App::composition` 现能路由到原生 Canvas 后端，headless/原生 IME 行为一致
+- [x] `examples/headless_loop.php`：Ticker 驱动 Reference 逐帧渲染动画，可导出 PNG 帧（零 FFI）
+- [x] `examples/ime.php`：Reference 接收 composition 事件并渲染待定预览（零 FFI）
+- [x] `examples/html_anim.php`：Html 后端把 `anim` 输出为 CSS `@keyframes`+`animation`（零 FFI）
+- [x] 修复 `Html::renderNode` 动画时长初值 `1000` 覆盖更短 `duration` → 改为 `0.0` 取 `max`
+- [x] `tests/CanvasImeTest.php`：Canvas 组合状态存储/清除/end 幂等
+- Status: done
+
+### P4: scroll 内容裁剪（native SDK 支持）（成熟度提升）
+- [x] `Cairo` FFI 新增 `cairo_save`/`cairo_restore`/`cairo_clip` 及 image surface 像素读回函数（libcairo 自带，无需改 C）
+- [x] `Layout::scroll` 在其子节点后追加零尺寸 `scroll_end` 哨兵，`Canvas::paint` 绘制循环用裁剪栈配对（LIFO 兼容嵌套 scroll），实现真正的溢出裁剪
+- [x] `Canvas::offscreenPixels()` 提供 headless 像素读回（与 Reference `pixelsHash` 对齐），用于验证裁剪
+- [x] `Layout::hitTest` 与 `Reference::draw` 显式跳过 `scroll_end` 哨兵（不误命中 / 不改快照基线）
+- [x] `tests/ScrollClipTest.php`：Cairo 裁剪机制确定性 + Layout 哨兵 + Canvas 像素级 overflow 被裁剪
+- Status: done
+
+### P5: scroll 交互（键盘 + 鼠标滚轮）（成熟度提升）
+- [x] `libui3.h` 枚举新增 `UI3_EVENT_WHEEL = 5`；`Canvas::onEvent` 新增 `WHEEL` 分支（`scrollContainerAt` + `scrollBy`）
+- [x] `Canvas` 新增 `activeScrollId`（`POINTER_DOWN` 记录光标所在 scroll 容器）+ `onKey` ↑/↓ 拦截滚动（±40px）
+- [x] 三平台宿主转发滚轮：`cocoa.m` `scrollWheel:`、`win32.c` `WM_MOUSEWHEEL`、`x11.c` `ButtonPress` 区分 Button4/5（符号统一 data>0 = 向下滚）
+- [x] `examples/scroll_window.php`：真实窗口示例（默认 headless sanity 帧，`UI3_REAL_WINDOW=1` 弹窗，列表溢出裁剪 + 滚轮/↑↓ 滚动）
+- [x] `tests/ScrollInteractionTest.php`：键盘箭头滚动 + WHEEL 滚动 + 滚动后仍裁剪
+- Status: done
+
 ## All phases complete
-十个方向全部补齐：主题/令牌、布局引擎、缺失组件、动画、事件/输入、状态/响应式、无障碍、多窗口、Web 目标、其他系统。
+十个方向全部补齐：主题/令牌、布局引擎、缺失组件、动画、事件/输入、状态/响应式、无障碍、多窗口、Web 目标、其他系统。P0/P1 渲染底座与动画/文本成熟度已提升。
 
 ## Key Decisions
 - 每方向三层(DSL+Canvas+自动化)最小实现，可被 MCP 观测。

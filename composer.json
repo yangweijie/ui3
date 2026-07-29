@@ -31,6 +31,7 @@
     "scripts": {
         "build": "bash ext/build.sh",
         "test": "bash bin/run.sh php -d ffi.enable=true vendor/bin/pest",
+        "test:ref": "vendor/bin/pest --filter ReferenceRenderTest",
         "example": "bash bin/run.sh php -d ffi.enable=true examples/counter.php",
         "automation": "bash bin/run.sh php -d ffi.enable=true examples/automation.php",
         "widgets": "bash bin/run.sh php -d ffi.enable=true examples/widgets.php",

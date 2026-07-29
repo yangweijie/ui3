@@ -30,8 +30,28 @@ final class Layout
     public const SIDEBAR_W = 180;
     public const STATUSBAR_H = 28;
 
+    /** Optional pure-PHP text measurer (set by the Reference backend so it can
+     *  lay out without the Cairo/FFI dependency). Null -> use Cairo (default). */
+    /** @var ?callable(string,int):float */
+    private static $textWidthFn = null;
+    /** Per-id content (natural) height of scroll containers, filled during compute(). */
+    private static array $scrollContent = [];
+
+    public static function setTextWidth(?callable $fn): void
+    {
+        self::$textWidthFn = $fn;
+    }
+
+    public static function resetTextWidth(): void
+    {
+        self::$textWidthFn = null;
+    }
+
     public static function textWidth(string $s, float $size = 13.0): float
     {
+        if (self::$textWidthFn !== null) {
+            return (self::$textWidthFn)($s, $size);
+        }
         return Cairo::measureText($s, $size)['w'];
     }
 
@@ -42,6 +62,7 @@ final class Layout
     public static function compute(Element $root, array $overrides = []): array
     {
         self::$overrides = $overrides;
+        self::$scrollContent = [];
         $nodes = [];
         $w = (int) $root->prop('width', 320);
         $h = (int) $root->prop('height', 240);
@@ -87,6 +108,12 @@ final class Layout
         return $nodes;
     }
 
+    /** Natural content height of a scroll container, or 0 if unknown. */
+    public static function scrollContentHeight(string $id): int
+    {
+        return self::$scrollContent[$id] ?? 0;
+    }
+
     /**
      * @param list<Element> $els
      * @param list<Node>    $nodes
@@ -101,6 +128,9 @@ final class Layout
         $best = null;
         $bestArea = PHP_INT_MAX;
         foreach ($nodes as $n) {
+            if ($n->type === 'scroll_end') {
+                continue; // sentinel, never hit-testable
+            }
             if ($x >= $n->x && $x <= $n->x + $n->w && $y >= $n->y && $y <= $n->y + $n->h) {
                 $area = $n->w * $n->h;
                 if ($area < $bestArea) {
@@ -273,7 +303,15 @@ final class Layout
                 $nodes[] = new Node($el, 'scroll', $x, $y, $w, $h);
                 $id = $el->prop('id');
                 $off = (int)($id !== null && isset(self::$overrides[$id]) ? self::$overrides[$id] : $el->prop('offset', 0));
-                self::placeColumn($el->children, $x, $y - $off, $w, $nodes);
+                // placeColumn returns the natural content height; capture it so the
+                // painter can size the scrollbar thumb.
+                $contentH = self::placeColumn($el->children, $x, $y - $off, $w, $nodes);
+                if ($id !== null) {
+                    self::$scrollContent[(string) $id] = $contentH;
+                }
+                // Sentinel marking the end of this scroll container's content so
+                // the Canvas painter can pop the clip region it pushed for it.
+                $nodes[] = new Node($el, 'scroll_end', $x, $y, 0, 0);
                 return $h;
             case 'menu':
                 return self::placeMenu($el, $x, $y, $w, $nodes);
@@ -374,26 +412,41 @@ final class Layout
             if ((bool) $el->prop('virtual', false)) {
                 // windowed rendering: only materialize the visible `viewport` rows
                 $vh = (int) $el->prop('viewport', 10);
-                $h = $vh * self::LISTITEM;
-                $nodes[] = new Node($el, 'list', $x, $y, $w, $h);
-                $id = $el->prop('id');
-                $scroll = $id !== null && isset(self::$overrides[$id]) ? (int) self::$overrides[$id] : (int) $el->prop('scroll', 0);
-                $start = max(0, min($scroll, count($items) - 1));
-                $end = min(count($items), $start + $vh);
-                for ($i = $start; $i < $end; $i++) {
-                    $iy = $y + ($i - $start) * self::LISTITEM;
-                    $nodes[] = new Node(new Element('list_item', [
-                        'id' => null,
-                        'title' => (string) $items[$i],
-                        '_onSelect' => $el->prop('onSelect'),
-                        '_index' => $i,
-                    ]), 'list_item', $x, $iy, $w, self::LISTITEM);
-                }
-                return $h;
+            $h = $vh * self::LISTITEM;
+            $nodes[] = new Node($el, 'list', $x, $y, $w, $h);
+            $id = $el->prop('id');
+            // Scroll offset is in PIXELS (matching the scroll-container model);
+            // the initial `scroll` prop (item index) is converted to px here.
+            $offPx = ($id !== null && isset(self::$overrides[$id]))
+                ? (int) self::$overrides[$id]
+                : (int) $el->prop('scroll', 0) * self::LISTITEM;
+            $count = count($items);
+            $maxStart = max(0, $count - $vh);
+            $start = max(0, min($maxStart, (int) round($offPx / self::LISTITEM)));
+            $end = min($count, $start + $vh);
+            $sel = (int) $el->prop('value', -1);
+            for ($i = $start; $i < $end; $i++) {
+                $iy = $y + ($i - $start) * self::LISTITEM;
+                $nodes[] = new Node(new Element('list_item', [
+                    'id' => null,
+                    'title' => (string) $items[$i],
+                    '_onSelect' => $el->prop('onSelect'),
+                    '_index' => $i,
+                    '_sel' => $i === $sel,
+                    '_listId' => $id,
+                ]), 'list_item', $x, $iy, $w, self::LISTITEM);
+            }
+            if ($id !== null) {
+                self::$scrollContent[(string) $id] = $total;
+            }
+            return $h;
             }
             $h = $allottedH > 0 ? $allottedH : $total;
             $nodes[] = new Node($el, 'list', $x, $y, $w, $h);
             self::placeColumnOf($el, $items, $x, $y, $w, $nodes);
+            if (($lid = $el->prop('id')) !== null) {
+                self::$scrollContent[(string) $lid] = $total;
+            }
             return $h;
         }
         $cy = $y;
@@ -414,6 +467,9 @@ final class Layout
             $idx++;
         }
         $nodes[] = new Node($el, 'list', $x, $y, $w, $h);
+        if (($lid = $el->prop('id')) !== null) {
+            self::$scrollContent[(string) $lid] = $h;
+        }
         return $h;
     }
 

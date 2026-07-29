@@ -79,8 +79,9 @@ void ui3_host_present(ui3_host *host)
     if (host->headless) {
         present_offscreen(host);
     } else {
-        ui3_plat_request_redraw(host);
+        ui3_plat_present(host);
     }
+    host->needs_redraw = 0;
 }
 
 double ui3_host_scale(ui3_host *host)   { return host ? host->scale : 1.0; }

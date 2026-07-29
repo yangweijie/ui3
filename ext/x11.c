@@ -83,9 +83,17 @@ static void x11_dispatch(x11_plat *p, XEvent *ev)
             x11_key(p, &ev->xkey);
             break;
         case ButtonPress:
-            if (host->event_cb)
-                host->event_cb(host->event_ctx, UI3_EVENT_POINTER_DOWN,
-                               (double)ev->xbutton.x, (double)ev->xbutton.y, 0, NULL);
+            if (host->event_cb) {
+                if (ev->xbutton.button == 4 || ev->xbutton.button == 5) {
+                    // data > 0 == scroll down. X11 Button5 is down, Button4 up.
+                    double dy = (ev->xbutton.button == 5) ? 40.0 : -40.0;
+                    host->event_cb(host->event_ctx, UI3_EVENT_WHEEL,
+                                   (double)ev->xbutton.x, (double)ev->xbutton.y, dy, NULL);
+                } else {
+                    host->event_cb(host->event_ctx, UI3_EVENT_POINTER_DOWN,
+                                   (double)ev->xbutton.x, (double)ev->xbutton.y, 0, NULL);
+                }
+            }
             break;
         case ButtonRelease:
             if (host->event_cb)
@@ -143,11 +151,20 @@ int ui3_plat_create_window(ui3_host *host, const char *title)
     return 0;
 }
 
+/* ASYNC: only flag the need; the run loop (ui3_plat_run) draws when idle so a
+ * draw callback that requests a redraw cannot re-enter paint() synchronously. */
 void ui3_plat_request_redraw(ui3_host *host)
+{
+    if (!host) return;
+    host->needs_redraw = 1;
+}
+
+/* SYNC: paint one frame immediately. */
+void ui3_plat_present(ui3_host *host)
 {
     x11_plat *p = host->plat;
     if (!p) return;
-    x11_draw(p);   /* paint synchronously so a single present() shows the frame */
+    x11_draw(p);
 }
 
 void ui3_plat_post_key(ui3_host *host, int keycode, int shift, const char *chars)
@@ -177,9 +194,17 @@ void ui3_plat_run(ui3_host *host)
     x11_plat *p = host->plat;
     if (!p) return;
     while (host->running) {
-        XEvent ev;
-        XNextEvent(p->dpy, &ev);   /* blocking */
-        x11_dispatch(p, &ev);
+        if (host->needs_redraw) {
+            /* Animation/fade keeps requesting redraws: present and spin so the
+             * frame loop advances without blocking on the X event queue. */
+            ui3_plat_present(p);
+            host->needs_redraw = 0;
+            usleep(4000); /* ~250Hz cap while animating; keeps CPU sane */
+        } else {
+            XEvent ev;
+            XNextEvent(p->dpy, &ev);   /* blocking when idle (0 CPU) */
+            x11_dispatch(p, &ev);
+        }
     }
 }
 

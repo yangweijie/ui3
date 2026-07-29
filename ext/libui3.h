@@ -19,6 +19,7 @@ typedef enum {
     UI3_EVENT_POINTER_UP = 2,
     UI3_EVENT_POINTER_MOVE = 3,
     UI3_EVENT_KEY = 4,
+    UI3_EVENT_WHEEL = 5, /* data = pixels; > 0 == scroll down (viewport offset increases) */
 } ui3_event_kind;
 
 typedef struct ui3_host ui3_host;

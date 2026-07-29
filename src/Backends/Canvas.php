@@ -57,8 +57,16 @@ final class Canvas implements Backend
     private array $animStates = [];
     /** Per-id scroll offset overrides (programmatic wheel/scroll). int by id. */
     private array $scrollOverrides = [];
+    /** Rubber-band elastic overshoot in px, keyed by id; decays to 0 each frame. */
+    private array $scrollElastic = [];
+    /** Clock time until which scrollbars stay fully visible (native overlay behaviour). */
+    private float $scrollbarVisibleUntil = 0.0;
     /** Open context menus keyed by element id => item list. */
     private array $contextMenus = [];
+    /** @var array<string,array{phase:string,text:string}> IME composition preview state. */
+    private array $composition = [];
+    /** Scroll container id activated by pointer-down, for arrow-key scrolling. */
+    private ?string $activeScrollId = null;
 
     private const POINTER_DOWN = 1;
     private const POINTER_UP = 2;
@@ -69,10 +77,15 @@ final class Canvas implements Backend
     private const KEY_RIGHT = "\x02";
     private const KEY_UP = "\x03";
     private const KEY_DOWN = "\x04";
+    /** Mouse-wheel event (host ABI UI3_EVENT_WHEEL). data = pixels scrolled. */
+    private const WHEEL = 5;
     /** Widget types that join the Tab order and show a focus ring. */
     private const FOCUSABLE = ['input', 'textarea', 'button', 'iconbutton', 'checkbox', 'radio', 'select', 'list', 'toggle', 'segmented', 'search'];
     /** Widget types browsable with arrow keys + Enter. */
     private const NAVIGABLE = ['list', 'select', 'segmented'];
+    private const SCROLLBAR_IDLE = 0.9;   // seconds visible after last scroll/hover
+    private const SCROLLBAR_FADE = 0.5;   // seconds to fade out once idle
+    private const SCROLL_ELASTIC_DAMP = 0.4; // fraction of overshoot shown visually
 
     public function __construct(private bool $headless = false)
     {
@@ -156,6 +169,12 @@ final class Canvas implements Backend
         }
     }
 
+    /** Wall-clock now, matching the value paint() assigns to $this->clock. */
+    private function now(): float
+    {
+        return $this->manualClock ? (float) ($this->clockOverride ?? 0.0) : microtime(true);
+    }
+
     // ---- input: keyboard focus, scroll, context menu, gestures ----
 
     /** Advance focus forward (Tab). */
@@ -173,30 +192,72 @@ final class Canvas implements Backend
     /** Programmatically scroll a list/scroll widget by $delta rows/pixels. */
     public function scrollBy(string $id, int $delta): void
     {
+        if ($this->layout === [] && $this->root) {
+            $this->layout = Layout::compute($this->root);
+        }
         $node = $this->findNodeById($id);
         if ($node === null) {
             return;
         }
-        $cur = (int) $node->el->prop('scroll', $node->el->prop('offset', 0));
-        $next = max(0, $cur + $delta);
-        $this->scrollOverrides[$id] = $next;
+        $sid = (string) $node->el->prop('id');
+        $cur = $this->scrollOffset($id);
+        $maxOff = max(0, Layout::scrollContentHeight($sid) - (int) $node->h);
+        $target = $cur + $delta;
+        if ($target < 0) {
+            $this->scrollOverrides[$id] = 0;
+            $this->scrollElastic[$id] = $target; // negative overshoot (rubber-band)
+        } elseif ($target > $maxOff) {
+            $this->scrollOverrides[$id] = $maxOff;
+            $this->scrollElastic[$id] = $target - $maxOff; // positive overshoot
+        } else {
+            $this->scrollOverrides[$id] = $target;
+            // residual elastic (if any) keeps decaying toward 0
+        }
+        $this->scrollbarVisibleUntil = $this->now() + self::SCROLLBAR_IDLE;
         $msg = $node->el->prop('onScroll');
         if (is_string($msg) && $msg !== '') {
-            ($this->dispatch)($msg, $next);
+            ($this->dispatch)($msg, $this->scrollOverrides[$id]);
         }
-        if ($this->host) {
-            Phpc::call($this->ffi, 'ui3_host_request_redraw', [$this->host]);
-        }
+        $this->requestRedraw();
     }
 
-    /** Current scroll offset for a list/scroll widget. */
+    /** Rendered offset = clamped target + damped rubber-band overshoot. */
+    private function effectiveScrollOffset(string $id): int
+    {
+        $off = $this->scrollOffset($id);
+        $e = $this->scrollElastic[$id] ?? 0.0;
+        return (int) round($off + $e * self::SCROLL_ELASTIC_DAMP);
+    }
+
+    /** Current scroll offset for a list/scroll widget (pixels). */
     public function scrollOffset(string $id): int
     {
         if (isset($this->scrollOverrides[$id])) {
             return (int) $this->scrollOverrides[$id];
         }
         $node = $this->findNodeById($id);
-        return $node ? (int) $node->el->prop('scroll', $node->el->prop('offset', 0)) : 0;
+        if ($node === null) {
+            return 0;
+        }
+        $raw = (int) $node->el->prop('scroll', $node->el->prop('offset', 0));
+        // A list's `scroll` prop is an item index; convert to pixels to match
+        // the scroll-container model (px) used everywhere else.
+        return $node->type === 'list' ? $raw * Layout::LISTITEM : $raw;
+    }
+
+    /**
+     * Feed an IME composition event for a field (start/update/end). Mirrors the
+     * headless Reference backend so the native path can also show a candidate
+     * preview. The next paint draws it after the committed value.
+     */
+    public function composition(string $id, string $phase, string $text): void
+    {
+        if ($phase === 'end') {
+            unset($this->composition[$id]);
+        } else {
+            $this->composition[$id] = ['phase' => $phase, 'text' => $text];
+        }
+        $this->requestRedraw();
     }
 
     /** Open the context menu attached to an element (right-click equivalent). */
@@ -425,6 +486,26 @@ final class Canvas implements Backend
         return $buf !== '' ? $buf : (string) $node->el->prop('placeholder', '');
     }
 
+    /**
+     * Draw an IME composition candidate preview after $committed text inside a
+     * field, with an accent colour and an underline (like a real IME preview).
+     */
+    private function drawComposition($cr, Element $el, string $committed, float $tx, float $ty, float $availW): void
+    {
+        $id = (string) $el->prop('id', '');
+        $comp = $id !== '' && isset($this->composition[$id]) ? $this->composition[$id] : null;
+        if ($comp === null || ($comp['text'] ?? '') === '') {
+            return;
+        }
+        $e = Cairo::textExtents($cr, $committed);
+        $cx = $tx + $e['w'];
+        Cairo::text($cr, $cx, $ty, $comp['text'], 13, ...$this->col('accent'));
+        $uw = (int) Cairo::textExtents($cr, $comp['text'])['w'];
+        if ($uw > 0) {
+            Cairo::fillRect($cr, $cx, $ty + 2, $uw, 1, ...$this->col('accent'));
+        }
+    }
+
     /** Current highlight index for a list/select (real-window browse state). */
     public function highlightIndex(string $id): int
     {
@@ -452,7 +533,7 @@ final class Canvas implements Backend
         // it into the Cairo wrapper's scope so its struct type matches.
         $cr = Cairo::ffi()->cast('cairo_t*', $cr);
         // Advance the animation clock (wall-clock for real windows, frozen for tests).
-        $this->clock = $this->manualClock ? (float)($this->clockOverride ?? 0.0) : microtime(true);
+        $this->clock = $this->now();
         $this->framesDrawn++;
         $w = $this->root ? (int) $this->root->prop('width', 320) : 320;
         $h = $this->root ? (int) $this->root->prop('height', 240) : 240;
@@ -460,12 +541,73 @@ final class Canvas implements Backend
         if (!$this->root) {
             return;
         }
-        $this->layout = Layout::compute($this->root, $this->scrollOverrides);
-        foreach ($this->layout as $n) {
-            $this->drawNode($cr, $n);
+        // Rubber-band: decay elastic overshoot toward 0 each frame so a past-edge
+        // scroll springs back. Then merge the damped overshoot into the offsets
+        // used for layout, so the content visually overshoots and settles.
+        foreach ($this->scrollElastic as $eid => $e) {
+            $e2 = $e * 0.82;
+            if (abs($e2) < 0.5) {
+                unset($this->scrollElastic[$eid]);
+            } else {
+                $this->scrollElastic[$eid] = $e2;
+            }
         }
-        // Keep the native frame loop alive while animations are still in flight.
-        if ($this->host && $this->isAnimating()) {
+        $offsets = [];
+        foreach ($this->scrollOverrides as $eid => $off) {
+            $e = $this->scrollElastic[$eid] ?? 0.0;
+            $offsets[$eid] = (int) round($off + $e * self::SCROLL_ELASTIC_DAMP);
+        }
+        $this->layout = Layout::compute($this->root, $offsets);
+        // Clip stack: each `scroll` node pushes its viewport rect (drawn unclipped
+        // as the frame), its content is painted clipped, and the `scroll_end`
+        // sentinel pops it. LIFO handles nested scrolls.
+        $clipStack = [];
+        foreach ($this->layout as $n) {
+            if ($n->type === 'scroll_end') {
+                $sc = array_pop($clipStack);
+                if ($sc !== null) {
+                    $this->drawScrollbar($cr, $sc);
+                }
+                continue;
+            }
+            $clip = $clipStack !== [] ? $clipStack[count($clipStack) - 1]['rect'] : null;
+            if ($clip !== null) {
+                Cairo::save($cr);
+                Cairo::clip($cr, $clip[0], $clip[1], $clip[2], $clip[3]);
+            }
+            $this->drawNode($cr, $n);
+            if ($clip !== null) {
+                Cairo::restore($cr);
+            }
+            if ($n->type === 'scroll') {
+                $id = $n->el->prop('id');
+                $sid = $id !== null ? (string) $id : '';
+                $clipStack[] = [
+                    'rect'     => [$n->x, $n->y, $n->w, $n->h],
+                    'node'     => $n,
+                    'contentH' => $sid !== '' ? Layout::scrollContentHeight($sid) : $n->h,
+                    'off'      => $sid !== '' ? $this->effectiveScrollOffset($sid) : 0,
+                ];
+            }
+        }
+        // Overlay scrollbars for virtual list controls, drawn last so they sit
+        // on top of their windowed rows (lists have no clip sentinel).
+        foreach ($this->layout as $n) {
+            if ($n->type !== 'list' || !(bool) $n->el->prop('virtual', false)) {
+                continue;
+            }
+            $id = $n->el->prop('id');
+            if ($id === null) {
+                continue;
+            }
+            $sid = (string) $id;
+            $this->paintScrollbar($cr, $n, Layout::scrollContentHeight($sid), $this->effectiveScrollOffset($sid));
+        }
+        // Keep the native frame loop alive while animations or scroll physics
+        // (rubber-band / scrollbar fade) are still in flight.
+        $scrollAnimating = $this->scrollElastic !== []
+            || $this->clock < $this->scrollbarVisibleUntil + self::SCROLLBAR_FADE;
+        if ($this->host && ($this->isAnimating() || $scrollAnimating)) {
             Phpc::call($this->ffi, 'ui3_host_request_redraw', [$this->host]);
         }
     }
@@ -479,8 +621,25 @@ final class Canvas implements Backend
             $this->onKey($text);
             return;
         }
+        if ($kind === self::WHEEL) {
+            // data > 0 means "scroll down" (viewport offset increases). The host
+            // normalizes each platform's wheel delta to pixels before calling.
+            $id = $this->scrollContainerAt($x, $y);
+            if ($id !== null) {
+                $this->scrollBy($id, (int) $data);
+            }
+            return;
+        }
         // Drag (MOVE/UP) is driven by the in-progress drag, not by hit-testing.
         if ($kind === self::POINTER_MOVE || $kind === self::POINTER_UP) {
+            // Native overlay scrollbars reveal on hover over a scroll container.
+            if ($kind === self::POINTER_MOVE) {
+                $sid = $this->scrollContainerAt($x, $y);
+                if ($sid !== null) {
+                    $this->scrollbarVisibleUntil = $this->now() + self::SCROLLBAR_IDLE;
+                    $this->requestRedraw();
+                }
+            }
             $this->onPointerDrag($kind, $x, $y);
             return;
         }
@@ -504,10 +663,18 @@ final class Canvas implements Backend
                 return;
             }
         }
+        // Grab the scrollbar (thumb drag or track jump) before content
+        // hit-testing, since the overlay bar sits on top of the content.
+        if ($this->tryBeginScrollbarDrag($x, $y)) {
+            return;
+        }
         $node = Layout::hitTest($this->layout, $x, $y);
         if (!$node || !$this->dispatch) {
             return;
         }
+        // Remember which scroll container the pointer landed in, so arrow keys
+        // can scroll it later (see onKey).
+        $this->activeScrollId = $this->scrollContainerAt($x, $y);
         // Clicking a focusable widget focuses it, like a real window.
         if (in_array($node->type, self::FOCUSABLE, true)
             && ($id = $node->el->prop('id')) !== null) {
@@ -516,10 +683,36 @@ final class Canvas implements Backend
         $this->fire($node, $x, $y);
     }
 
+    /** Return the id of the innermost scroll container containing (x, y). */
+    private function scrollContainerAt(float $x, float $y): ?string
+    {
+        $found = null;
+        foreach ($this->layout as $n) {
+            $isScroll = $n->type === 'scroll'
+                || ($n->type === 'list' && (bool) $n->el->prop('virtual', false));
+            if (!$isScroll) {
+                continue;
+            }
+            $id = $n->el->prop('id');
+            if ($id === null) {
+                continue;
+            }
+            if ($x >= $n->x && $x <= $n->x + $n->w && $y >= $n->y && $y <= $n->y + $n->h) {
+                $found = (string) $id; // later (inner) scrolls win on overlap
+            }
+        }
+        return $found;
+    }
+
     /** Route a keystroke: Tab, list/select browsing, or text editing. */
     private function onKey(?string $text): void
     {
         if ($text === null || $this->dispatch === null) {
+            return;
+        }
+        // Arrow Up/Down scroll the active scroll container (set on pointer-down).
+        if (($text === self::KEY_UP || $text === self::KEY_DOWN) && $this->activeScrollId !== null) {
+            $this->scrollBy($this->activeScrollId, $text === self::KEY_DOWN ? 40 : -40);
             return;
         }
         // Escape closes any expanded dropdown.
@@ -779,6 +972,165 @@ final class Canvas implements Backend
         return max(0, min(count($options) - 1, (int) (($x - $node->x) / $seg)));
     }
 
+    /**
+     * Scrollbar geometry (track + thumb rects) for a scroll container, derived
+     * from the same tokens used to paint it. Returns null when the content fits
+     * (no scrollbar). Shared by drawScrollbar() and pointer hit-testing so the
+     * thumb you see is exactly the one you can grab.
+     */
+    private function scrollbarGeom(Node $node, int $contentH, int $off): ?array
+    {
+        $vh = $node->h;
+        if ($contentH <= $vh) {
+            return null; // content fits; no scrollbar needed
+        }
+        $thickness = (int) ($this->theme['scrollbarThickness'] ?? 8);
+        $trackX = $node->x + $node->w - $thickness - 2;
+        $trackY = $node->y + 2;
+        $trackH = $vh - 4;
+        $maxOff = $contentH - $vh;
+        $thumbH = max(16, (int) (($vh / $contentH) * $trackH));
+        $thumbY = $trackY + (int) ((($trackH - $thumbH) * $off) / $maxOff);
+        return [
+            'thickness' => $thickness,
+            'trackX'    => $trackX,
+            'trackY'    => $trackY,
+            'trackH'    => $trackH,
+            'thumbH'    => $thumbH,
+            'thumbY'    => $thumbY,
+            'maxOff'    => $maxOff,
+            'vh'        => $vh,
+            'contentH'  => $contentH,
+        ];
+    }
+
+    /**
+     * Hit-test a vertical scrollbar against a pointer position. Returns 'thumb'
+     * if inside the draggable thumb, 'track' if elsewhere on the bar (a click
+     * jumps there), or null if outside the bar entirely.
+     */
+    private function hitScrollbar(float $x, float $y, array $g): ?string
+    {
+        if ($x >= $g['trackX'] - 2 && $x <= $g['trackX'] + $g['thickness'] + 2
+            && $y >= $g['trackY'] && $y <= $g['trackY'] + $g['trackH']) {
+            if ($y >= $g['thumbY'] && $y <= $g['thumbY'] + $g['thumbH']) {
+                return 'thumb';
+            }
+            return 'track';
+        }
+        return null;
+    }
+
+    /** Absolute scroll (clamped, no rubber-band) + onScroll + redraw. */
+    private function scrollTo(string $id, int $off): void
+    {
+        $node = $this->findNodeById($id);
+        if ($node === null) {
+            return;
+        }
+        $sid = (string) $node->el->prop('id');
+        $contentH = Layout::scrollContentHeight($sid);
+        $maxOff = max(0, $contentH - (int) $node->h);
+        $target = max(0, min($maxOff, $off));
+        $this->scrollOverrides[$id] = $target;
+        unset($this->scrollElastic[$id]);
+        $this->scrollbarVisibleUntil = $this->now() + self::SCROLLBAR_IDLE;
+        $msg = $node->el->prop('onScroll');
+        if (is_string($msg) && $msg !== '') {
+            ($this->dispatch)($msg, $target);
+        }
+        $this->requestRedraw();
+    }
+
+    /**
+     * Begin a scrollbar drag if the pointer lands on a scroll container's bar.
+     * Returns true (and arms $this->drag) when it consumes the press, so the
+     * caller skips the normal content hit-test / fire.
+     */
+    private function tryBeginScrollbarDrag(float $x, float $y): bool
+    {
+        $sid = $this->scrollContainerAt($x, $y);
+        if ($sid === null) {
+            return false;
+        }
+        $node = $this->findNodeById($sid);
+        if ($node === null) {
+            return false;
+        }
+        $contentH = Layout::scrollContentHeight($sid);
+        $g = $this->scrollbarGeom($node, $contentH, $this->effectiveScrollOffset($sid));
+        if ($g === null) {
+            return false;
+        }
+        $hit = $this->hitScrollbar($x, $y, $g);
+        if ($hit === null) {
+            return false;
+        }
+        if ($hit === 'track') {
+            // Click on the track: jump so the click lands mid-thumb, then start
+            // dragging from there (matches native track-click behaviour).
+            $jump = (int) ((($y - $g['trackY']) * $g['maxOff']) / max(1, $g['trackH'] - $g['thumbH']));
+            $this->scrollTo($sid, $jump - (int) ($g['thumbH'] / 2));
+            $g = $this->scrollbarGeom($node, $contentH, $this->effectiveScrollOffset($sid));
+            if ($g === null) {
+                $this->drag = ['type' => 'scrollbar', 'id' => $sid, 'grab' => 0, 'trackY' => 0, 'trackH' => 1, 'thumbH' => 1, 'maxOff' => 1];
+                $this->requestRedraw();
+                return true;
+            }
+            $grab = $g['thumbH'] / 2;
+        } else {
+            $grab = $y - $g['thumbY'];
+        }
+        $this->drag = [
+            'type'    => 'scrollbar',
+            'id'      => $sid,
+            'grab'    => $grab,
+            'trackY'  => $g['trackY'],
+            'trackH'  => $g['trackH'],
+            'thumbH'  => $g['thumbH'],
+            'maxOff'  => $g['maxOff'],
+        ];
+        $this->scrollbarVisibleUntil = $this->now() + self::SCROLLBAR_IDLE;
+        $this->requestRedraw();
+        return true;
+    }
+
+    /**
+     * Draw an overlay scrollbar (faint track + accent thumb) for a scrollable
+     * node. Shared by scroll containers (via the scroll_end sentinel) and
+     * virtual list controls (post-pass), so the geometry/alpha are identical.
+     *
+     * @param int $off Pixel scroll offset (matches the scroll-container model).
+     */
+    private function paintScrollbar($cr, Node $node, int $contentH, int $off): void
+    {
+        $g = $this->scrollbarGeom($node, $contentH, $off);
+        if ($g === null) {
+            return; // content fits; no scrollbar needed
+        }
+        // Overlay scrollbar (native behaviour): fully visible right after a
+        // scroll/hover, then fades out once idle. $this->clock is frozen in
+        // headless tests so the bar stays visible for assertions.
+        $remaining = $this->scrollbarVisibleUntil - $this->clock;
+        $alpha = $remaining > 0
+            ? 1.0
+            : max(0.0, min(1.0, ($remaining + self::SCROLLBAR_FADE) / self::SCROLLBAR_FADE));
+        if ($alpha <= 0.01) {
+            return;
+        }
+        $radius = (float) ($this->theme['scrollbarRadius'] ?? 3);
+        [$tr, $tg, $tb] = $this->col('scrollbarTrack');
+        [$hr, $hg, $hb] = $this->col('scrollbarThumb');
+        Cairo::fillRoundedRect($cr, $g['trackX'], $g['trackY'], $g['thickness'], $g['trackH'], $radius, $tr, $tg, $tb, 0.45 * $alpha);
+        Cairo::fillRoundedRect($cr, $g['trackX'], $g['thumbY'], $g['thickness'], $g['thumbH'], $radius, $hr, $hg, $hb, 0.9 * $alpha);
+    }
+
+    /** Scrollbar for a scroll container (carried by the scroll_end sentinel). */
+    private function drawScrollbar($cr, array $sc): void
+    {
+        $this->paintScrollbar($cr, $sc['node'], (int) $sc['contentH'], (int) $sc['off']);
+    }
+
     private function drawNode($cr, Node $n): void
     {
         $el = $n->el;
@@ -787,6 +1139,7 @@ final class Canvas implements Backend
         $f = Cairo::ffi();
 
         // ----- animation: interpolate translate / scale / opacity from the clock -----
+        // Shared with the headless Reference renderer via Animation::frame().
         $dx = 0; $dy = 0; $scale = 1.0; $alpha = 1.0;
         $anim = $el->prop('anim');
         if (is_array($anim) && $anim !== []) {
@@ -795,39 +1148,13 @@ final class Canvas implements Backend
                 $this->animStart[$aid] = $this->clock;
             }
             $elapsed = ($this->clock - $this->animStart[$aid]) * 1000.0;
-            $allDone = true;
-            foreach ($anim as $spec) {
-                $dur = (float)($spec['duration'] ?? 1000);
-                $delay = (float)($spec['delay'] ?? 0);
-                $p = Animation::progress($elapsed, $dur, $delay);
-                if ($p < 1.0) {
-                    $allDone = false;
-                }
-                $e = Animation::ease((string)($spec['easing'] ?? 'linear'), $p);
-                $from = (float)($spec['from'] ?? 0);
-                $to = (float)($spec['to'] ?? 1);
-                $v = $from + ($to - $from) * $e;
-                switch ($spec['key'] ?? 'opacity') {
-                    case 'x':
-                        $dx = $v;
-                        break;
-                    case 'y':
-                        $dy = $v;
-                        break;
-                    case 'scale':
-                        $scale = $v;
-                        break;
-                    default:
-                        $alpha = $v;
-                }
-            }
+            $st = Animation::frame($anim, $elapsed);
+            $alpha = $st['alpha']; $dx = $st['dx']; $dy = $st['dy']; $scale = $st['scale'];
             $x = (int)($x + $dx);
             $y = (int)($y + $dy);
             $w = (int)max(1, $w * $scale);
             $h = (int)max(1, $h * $scale);
-            $this->animStates[$aid] = [
-                'alpha' => $alpha, 'dx' => $dx, 'dy' => $dy, 'scale' => $scale, 'done' => $allDone,
-            ];
+            $this->animStates[$aid] = $st;
         }
 
         // Opacity is applied to the whole element subtree via a cairo group.
@@ -863,6 +1190,7 @@ final class Canvas implements Backend
                 $tc = $show !== '' && $show !== (string) $el->prop('placeholder', '')
                     ? $this->col('text') : $this->col('textMuted');
                 Cairo::text($cr, $x + 6, $y + 16, $show, 13, ...$tc);
+                $this->drawComposition($cr, $el, $show, $x + 6, $y + 16, $w - 10);
                 break;
             case 'checkbox':
             case 'radio':
@@ -908,21 +1236,23 @@ final class Canvas implements Backend
                 break;
             case 'list':
                 $items = $el->prop('items', []);
-                if ($items === []) {
-                    break; // rows (list_item) are drawn by their own nodes
-                }
                 Cairo::fillRect($cr, $x, $y, $w, $h, ...$this->col('surface'));
                 Cairo::strokeRect($cr, $x, $y, $w, $h, ...$this->col('border'));
-                $sel = (int) $el->prop('value', -1);
-                $hl = $this->highlights[(string) ($el->prop('id') ?? '')] ?? -1;
-                foreach ($items as $i => $it) {
-                    $iy = $y + 4 + $i * 20;
-                    if ($i === $sel) {
-                        Cairo::fillRect($cr, $x, $iy, $w, 20, ...$this->col('selected'));
-                    } elseif ($i === $hl) {
-                        Cairo::strokeRect($cr, $x + 1, $iy + 1, $w - 2, 18, ...[...$this->col('accent'), 2.0]);
+                // Virtual lists hand their rows to the windowed list_item nodes
+                // (correctly offset + clipped); only non-virtual item lists keep
+                // the legacy all-rows render here.
+                if ($items !== [] && !(bool) $el->prop('virtual', false)) {
+                    $sel = (int) $el->prop('value', -1);
+                    $hl = $this->highlights[(string) ($el->prop('id') ?? '')] ?? -1;
+                    foreach ($items as $i => $it) {
+                        $iy = $y + 4 + $i * 20;
+                        if ($i === $sel) {
+                            Cairo::fillRect($cr, $x, $iy, $w, 20, ...$this->col('selected'));
+                        } elseif ($i === $hl) {
+                            Cairo::strokeRect($cr, $x + 1, $iy + 1, $w - 2, 18, ...[...$this->col('accent'), 2.0]);
+                        }
+                        Cairo::text($cr, $x + 6, $iy + 14, (string) $it, 13, ...$this->col('text'));
                     }
-                    Cairo::text($cr, $x + 6, $iy + 14, (string) $it, 13, ...$this->col('text'));
                 }
                 break;
             case 'toggle':
@@ -1198,11 +1528,23 @@ final class Canvas implements Backend
         $showPlaceholder = $txt === '' && ((string) ($el->prop('id') ?? '') !== $this->focusId);
         $tc = $this->col($showPlaceholder ? 'textMuted' : 'text');
         Cairo::text($cr, $x + 28, $y + $h / 2 + 4, $showPlaceholder ? (string) $el->prop('placeholder', '') : $txt, 13, ...$tc);
+        if (!$showPlaceholder) {
+            $this->drawComposition($cr, $el, $txt, $x + 28, $y + $h / 2 + 4, $w - 34);
+        }
     }
 
     private function drawListItem($cr, Element $el, float $x, float $y, float $w, float $h): void
     {
         Cairo::fillRect($cr, $x, $y, $w, $h, ...$this->col('surface'));
+        $sel = (bool) $el->prop('_sel', false);
+        $listId = $el->prop('_listId');
+        $idx = (int) $el->prop('_index', -1);
+        $hl = ($listId !== null && $idx >= 0 && ($this->highlights[(string) $listId] ?? -1) === $idx);
+        if ($sel) {
+            Cairo::fillRect($cr, $x, $y, $w, $h, ...$this->col('selected'));
+        } elseif ($hl) {
+            Cairo::strokeRect($cr, $x + 1, $y + 1, $w - 2, $h - 2, ...[...$this->col('accent'), 2.0]);
+        }
         $icon = (string) $el->prop('icon', '');
         if ($icon !== '') {
             Cairo::text($cr, $x + 10, $y + $h / 2 + 5, $icon, 14, ...$this->col('textMuted'));
@@ -1271,6 +1613,15 @@ final class Canvas implements Backend
                 if (is_string($msg) && $msg !== '') {
                     ($this->dispatch)($msg, (int) ($frac * 100));
                 }
+            }
+            return;
+        }
+        if ($d['type'] === 'scrollbar') {
+            $node = $this->findNodeById($d['id']);
+            if ($node !== null) {
+                $raw = $y - $d['grab'] - $d['trackY'];
+                $off = (int) (($raw * $d['maxOff']) / max(1, $d['trackH'] - $d['thumbH']));
+                $this->scrollTo($d['id'], $off);
             }
             return;
         }
@@ -1344,6 +1695,38 @@ final class Canvas implements Backend
             return $this->headless;
         }
         return (int) Phpc::call($this->ffi, 'ui3_host_is_headless', [$this->host]) === 1;
+    }
+
+    /**
+     * Render the current tree to an offscreen ARGB32 surface and return its
+     * pixels as [y][x] => [r,g,b]. Headless snapshot readback (mirrors the
+     * Reference backend's pixelsHash) used to verify painting — e.g. that a
+     * scroll container clips its overflowing content.
+     */
+    public function offscreenPixels(): array
+    {
+        $f = Cairo::ffi();
+        $w = $this->root ? (int) $this->root->prop('width', 320) : 320;
+        $h = $this->root ? (int) $this->root->prop('height', 240) : 240;
+        $surf = $f->cairo_image_surface_create(0, $w, $h); // CAIRO_FORMAT_ARGB32
+        $cr = $f->cairo_create($surf);
+        $this->paint($cr);
+        $f->cairo_destroy($cr);
+        $f->cairo_surface_flush($surf);
+        $data = $f->cairo_image_surface_get_data($surf);
+        $stride = $f->cairo_image_surface_get_stride($surf);
+        $px = [];
+        for ($y = 0; $y < $h; $y++) {
+            $row = [];
+            for ($x = 0; $x < $w; $x++) {
+                $o = $y * $stride + $x * 4;
+                // ARGB32 is stored BGRA in memory on little-endian hosts.
+                $row[] = [$data[$o + 2], $data[$o + 1], $data[$o]];
+            }
+            $px[] = $row;
+        }
+        $f->cairo_surface_destroy($surf);
+        return ['w' => $w, 'h' => $h, 'px' => $px];
     }
 
     /** Number of frames actually painted (proves the real-window draw path). */

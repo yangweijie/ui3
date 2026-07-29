@@ -7,6 +7,7 @@ namespace Yangweijie\Ui3;
 use Yangweijie\Ui3\Automation\Automation;
 use Yangweijie\Ui3\Extensions;
 use Yangweijie\Ui3\System\AutomationServer;
+use Yangweijie\Ui3\Ticker;
 use Yangweijie\Ui3\Windows;
 
 /**
@@ -35,6 +36,14 @@ final class App
 
     /** Extension hook bus (mirrors native's extensions/). */
     private Extensions $extensions;
+
+    /** Headless frame-driver config (used when the backend has no native loop). */
+    private ?int $headlessFrames = null;
+    private float $headlessFps = 60.0;
+    private ?float $headlessDuration = null;
+    /** @var ?callable(float $t, Backend $backend):void */
+    private $headlessOnFrame = null;
+    private ?\Closure $clock = null;
 
     /**
      * @param mixed    $init   initial model, or a callable () => model
@@ -178,6 +187,107 @@ final class App
             $server->stop();
             return;
         }
+        if ($backend->isHeadless()) {
+            $this->runHeadlessLoop();
+            return;
+        }
         $backend->run();
+    }
+
+    /**
+     * Configure a headless (no native event loop) frame driver. When the
+     * backend reports isHeadless(), run() uses a Ticker instead of the
+     * backend's own loop, advancing the animation clock and repainting each
+     * frame. Without $durationSec it runs until the UI stops animating (or
+     * $frames cap is hit); pass $onFrame to capture/inspect each frame.
+     *
+     * @param ?callable(float $t, Backend $backend):void $onFrame
+     */
+    public function headless(int $frames, float $fps = 60.0, ?float $durationSec = null, ?callable $onFrame = null): self
+    {
+        $this->headlessFrames = $frames;
+        $this->headlessFps = $fps;
+        $this->headlessDuration = $durationSec;
+        $this->headlessOnFrame = $onFrame;
+        return $this;
+    }
+
+    /** Inject a clock source (seconds) so the headless loop is deterministic in tests. */
+    public function withClock(\Closure $now): self
+    {
+        $this->clock = $now;
+        return $this;
+    }
+
+    /**
+     * Feed an IME composition event for a field (start/update/end). For a
+     * headless backend this injects the preview state and repaints once so the
+     * change is visible without a native event loop. Native backends wire this
+     * to the platform's composition callbacks.
+     */
+    public function composition(string $id, string $phase, string $text): void
+    {
+        if ($this->backend !== null && method_exists($this->backend, 'composition')) {
+            $this->backend->composition($id, $phase, $text);
+        }
+        if ($this->backend !== null && $this->backend->isHeadless() && method_exists($this->backend, 'update')) {
+            $this->backend->update($this->render());
+        }
+    }
+
+    private function runHeadlessLoop(): void
+    {
+        $backend = $this->backend;
+        $ticker = new Ticker($this->clock);
+        $maxFrames = $this->headlessFrames ?? 0;
+        $duration = $this->headlessDuration ?? 0.0;
+        if ($duration <= 0.0 && $maxFrames <= 0) {
+            $duration = $this->computeAnimDuration();
+        }
+        // Render the tree ONCE and reuse the same Element objects every frame.
+        // Animation start times key off element identity (spl_object_id), so a
+        // fresh tree each frame would reset the clock to t=0 every time.
+        $root = $this->render();
+        $onFrame = function (float $t) use ($backend, $root, $maxFrames, $duration, $ticker): bool {
+            if (method_exists($backend, 'setClock')) {
+                $backend->setClock($t);
+            }
+            $backend->update($root);
+            if ($this->headlessOnFrame !== null) {
+                ($this->headlessOnFrame)($t, $backend);
+            }
+            if ($maxFrames > 0 && $ticker->frames >= $maxFrames) {
+                return false;
+            }
+            if ($duration > 0.0 && $t >= $duration) {
+                return false;
+            }
+            if ($duration <= 0.0 && method_exists($backend, 'isAnimating') && !$backend->isAnimating()) {
+                return false;
+            }
+            return true;
+        };
+        $ticker->run($onFrame, $duration > 0.0 ? $duration : 30.0, $this->headlessFps);
+    }
+
+    /** Longest animation duration (+delay) across the current view, in seconds. */
+    private function computeAnimDuration(): float
+    {
+        $max = 0.0;
+        $walk = function (Element $el) use (&$walk, &$max): void {
+            $anim = $el->prop('anim');
+            if (is_array($anim)) {
+                foreach ($anim as $s) {
+                    $max = max($max, (float)($s['duration'] ?? 1000) + (float)($s['delay'] ?? 0));
+                }
+            }
+            foreach ($el->children as $c) {
+                if ($c instanceof Element) {
+                    $walk($c);
+                }
+            }
+        };
+        $walk($this->render());
+        return $max > 0.0 ? $max / 1000.0 + 0.1 : 0.0;
     }
 }

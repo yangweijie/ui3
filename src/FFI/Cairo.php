@@ -42,6 +42,17 @@ void cairo_surface_destroy(cairo_surface_t* surface);
 void cairo_push_group(cairo_t* cr);
 void cairo_pop_group_to_source(cairo_t* cr);
 void cairo_paint_with_alpha(cairo_t* cr, double alpha);
+void cairo_save(cairo_t* cr);
+void cairo_restore(cairo_t* cr);
+void cairo_new_path(cairo_t* cr);
+void cairo_close_path(cairo_t* cr);
+void cairo_arc(cairo_t* cr, double xc, double yc, double radius, double angle1, double angle2);
+void cairo_clip(cairo_t* cr);
+void cairo_surface_flush(cairo_surface_t* surface);
+unsigned char* cairo_image_surface_get_data(cairo_surface_t* surface);
+int cairo_image_surface_get_width(cairo_surface_t* surface);
+int cairo_image_surface_get_height(cairo_surface_t* surface);
+int cairo_image_surface_get_stride(cairo_surface_t* surface);
 C;
 
     public static function ffi(): FFI
@@ -82,6 +93,34 @@ C;
         $f->cairo_fill($cr);
     }
 
+    /**
+     * Filled rounded rectangle (mirrors native's fillRoundedRect). Used by the
+     * scrollbar track/thumb so the bar is themeable via Design Tokens.
+     */
+    public static function fillRoundedRect(
+        $cr, float $x, float $y, float $w, float $h, float $radius,
+        float $r, float $g, float $b, float $a = 1.0
+    ): void {
+        $f = self::ffi();
+        $rad = min($radius, $w / 2.0, $h / 2.0);
+        if ($rad <= 0.5) {
+            self::fillRect($cr, $x, $y, $w, $h, $r, $g, $b, $a);
+            return;
+        }
+        if ($a >= 1.0) {
+            $f->cairo_set_source_rgb($cr, $r, $g, $b);
+        } else {
+            $f->cairo_set_source_rgba($cr, $r, $g, $b, $a);
+        }
+        $f->cairo_new_path($cr);
+        $f->cairo_arc($cr, $x + $w - $rad, $y + $rad, $rad, -M_PI / 2, 0);
+        $f->cairo_arc($cr, $x + $w - $rad, $y + $h - $rad, $rad, 0, M_PI / 2);
+        $f->cairo_arc($cr, $x + $rad, $y + $h - $rad, $rad, M_PI / 2, M_PI);
+        $f->cairo_arc($cr, $x + $rad, $y + $rad, $rad, M_PI, M_PI * 1.5);
+        $f->cairo_close_path($cr);
+        $f->cairo_fill($cr);
+    }
+
     public static function strokeRect($cr, float $x, float $y, float $w, float $h, float $r, float $g, float $b, float $lw = 1.0): void
     {
         $f = self::ffi();
@@ -99,6 +138,26 @@ C;
         $f->cairo_move_to($cr, $x1, $y1);
         $f->cairo_line_to($cr, $x2, $y2);
         $f->cairo_stroke($cr);
+    }
+
+    /** Save the current cairo state (push) before applying a clip region. */
+    public static function save($cr): void
+    {
+        self::ffi()->cairo_save($cr);
+    }
+
+    /** Restore the cairo state saved by {@see save} (pop), dropping any clip. */
+    public static function restore($cr): void
+    {
+        self::ffi()->cairo_restore($cr);
+    }
+
+    /** Clip subsequent drawing to the rectangle (x, y, w, h). */
+    public static function clip($cr, float $x, float $y, float $w, float $h): void
+    {
+        $f = self::ffi();
+        $f->cairo_rectangle($cr, $x, $y, $w, $h);
+        $f->cairo_clip($cr);
     }
 
     /** @return array{w:float,h:float,x_advance:float} */

@@ -213,6 +213,26 @@ C;
         ];
     }
 
+    /** Context-free text extents (ink width + advance), same measureCr as
+     *  measureText but returns cairo's width (bounding box) not just advance. */
+    public static function measureExtents(string $text, float $size, ?string $family = null, int $weight = 0, int $slant = 0): array
+    {
+        $cr = self::measureCr();
+        if ($cr === null) {
+            $w = mb_strlen($text) * $size * 0.55;
+            return ['w' => $w, 'x_advance' => $w];
+        }
+        $f = self::ffi();
+        $f->cairo_select_font_face($cr, $family ?? self::defaultFamily(), $slant, $weight);
+        $f->cairo_set_font_size($cr, $size);
+        $ext = $f->new('cairo_text_extents_t');
+        $f->cairo_text_extents($cr, $text, \FFI::addr($ext));
+        return [
+            'w' => (float) $ext->width,
+            'x_advance' => (float) $ext->x_advance,
+        ];
+    }
+
     /**
      * Set the source pattern to the given surface. Used by the compositor
      * to blit the backing surface to the host cr.

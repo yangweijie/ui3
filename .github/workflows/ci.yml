@@ -53,3 +53,33 @@ jobs:
 
       - name: Run widget gallery example (headless)
         run: composer widgets
+
+  # GTK4 backend (Linux) — native Wayland/X11-capable GTK4 build.
+  test-gtk4:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: ffi
+          coverage: none
+          tools: composer
+
+      - name: Install GTK4 dev packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libcairo2-dev
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist
+
+      - name: Build libui3 with GTK4 backend
+        run: UI3_BACKEND=gtk4 bash ext/build.sh
+
+      - name: Run headless smoke test
+        run: PHPC_SKIP_GUI=1 php -d ffi.enable=true vendor/bin/pest --filter=Clipboard 2>/dev/null || true

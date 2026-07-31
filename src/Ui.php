@@ -76,25 +76,27 @@ final class Ui
     }
 
     /** Single-line editable text field. Emits $onInput with the new string. */
-    public static function input(?string $value = null, ?string $placeholder = null, ?string $onInput = null, ?string $id = null, ?string $onComposition = null): Element
+    public static function input(?string $value = null, ?string $placeholder = null, ?string $onInput = null, ?string $id = null, ?string $onComposition = null, bool $spellcheck = false): Element
     {
         return new Element('input', [
             'text' => $value ?? '',
             'placeholder' => $placeholder ?? '',
             'onInput' => $onInput,
             'onComposition' => $onComposition,
+            'spellcheck' => $spellcheck,
             'id' => $id,
         ]);
     }
 
     /** Multi-line editable text area. Emits $onInput with the new string. */
-    public static function textarea(?string $value = null, ?string $placeholder = null, ?string $onInput = null, ?string $id = null, ?string $onComposition = null): Element
+    public static function textarea(?string $value = null, ?string $placeholder = null, ?string $onInput = null, ?string $id = null, ?string $onComposition = null, bool $spellcheck = false): Element
     {
         return new Element('textarea', [
             'text' => $value ?? '',
             'placeholder' => $placeholder ?? '',
             'onInput' => $onInput,
             'onComposition' => $onComposition,
+            'spellcheck' => $spellcheck,
             'id' => $id,
         ]);
     }
@@ -237,12 +239,13 @@ final class Ui
     }
 
     /** Search field (native 'search_field'). Emits $onInput with the new string. */
-    public static function searchField(?string $value = null, ?string $placeholder = null, ?string $onInput = null, ?string $id = null, ?string $onComposition = null): Element
+    public static function searchField(?string $value = null, ?string $placeholder = null, ?string $onInput = null, ?string $id = null, ?string $onComposition = null, bool $spellcheck = false): Element
     {
         return new Element('search', [
             'text' => $value ?? '',
             'placeholder' => $placeholder ?? '',
             'onInput' => $onInput,
+            'spellcheck' => $spellcheck,
             'id' => $id,
         ]);
     }

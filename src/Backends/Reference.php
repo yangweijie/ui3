@@ -37,6 +37,9 @@ final class Reference implements Backend
     private array $animStates = [];
     /** @var array<string,array{phase:string,text:string}> */
     private array $composition = [];
+    /** @var array<string,array{text:string,errors:list<array{start:int,end:int,word:string}>}> */
+    private array $spell = [];
+    private ?\Yangweijie\Ui3\Spellcheck $spellcheck = null;
 
     /** @param string|array $theme Theme name (Theme::*) or a resolved token map */
     public function __construct(int $width = 640, int $height = 400, string|array $theme = Theme::LIGHT)
@@ -126,6 +129,43 @@ final class Reference implements Backend
         } else {
             $this->composition[$id] = ['phase' => $phase, 'text' => $text];
         }
+    }
+
+    /** Draw red wavy underlines under misspelled words (GD parity of Canvas::drawSpellSquiggles). */
+    private function drawSpellSquiggles(\GdImage $img, string $id, string $text, int $x0, int $y0): void
+    {
+        $errors = $this->spellErrors($id, $text);
+        if ($errors === []) {
+            return;
+        }
+        $danger = $this->c('danger');
+        foreach ($errors as $err) {
+            $xa = $x0 + (int) self::pureTextWidth(mb_substr($text, 0, $err['start']), 13.0);
+            $xb = $x0 + (int) self::pureTextWidth(mb_substr($text, 0, $err['end']), 13.0);
+            if ($xb - $xa < 1) {
+                continue;
+            }
+            for ($sx = $xa, $i = 0; $sx < $xb - 1; $sx += 3, $i++) {
+                $yy = $y0 + ($i % 2);
+                imageline($img, $sx, $yy, min($sx + 3, $xb), $yy, $danger);
+            }
+        }
+    }
+
+    private function spellErrors(string $id, string $text): array
+    {
+        $cached = $this->spell[$id] ?? null;
+        if ($cached !== null && $cached['text'] === $text) {
+            return $cached['errors'];
+        }
+        $errors = $this->spellcheck()->errors($text);
+        $this->spell[$id] = ['text' => $text, 'errors' => $errors];
+        return $errors;
+    }
+
+    private function spellcheck(): \Yangweijie\Ui3\Spellcheck
+    {
+        return $this->spellcheck ??= new \Yangweijie\Ui3\Spellcheck();
     }
 
     public function root(): ?Element
@@ -289,6 +329,9 @@ final class Reference implements Backend
                     $this->text($cx, $ty, $comp['text'], 'accentText', 13.0, max(1, $w - 8 - ($cx - $x)));
                     $ulen = max(1, (int) self::pureTextWidth($comp['text'], 13.0));
                     imageline($img, $cx, $ty + 13, $cx + $ulen, $ty + 13, $this->c('accent'));
+                }
+                if ($el->prop('spellcheck') && $value !== '') {
+                    $this->drawSpellSquiggles($img, $cid, $value, $x + 4, $ty + 13);
                 }
                 break;
 

@@ -66,6 +66,9 @@ final class Canvas implements Backend
     private array $contextMenus = [];
     /** @var array<string,array{phase:string,text:string}> IME composition preview state. */
     private array $composition = [];
+    /** @var array<string,array{text:string,errors:list<array{start:int,end:int,word:string}>}> spell-check error cache per field. */
+    private array $spellErrors = [];
+    private ?\Yangweijie\Ui3\Spellcheck $spellcheck = null;
     /** Scroll container id activated by pointer-down, for arrow-key scrolling. */
     private ?string $activeScrollId = null;
 
@@ -910,7 +913,8 @@ final class Canvas implements Backend
                     $sid = (string)$id;
                     if (in_array($node->type, ['input', 'textarea', 'search'], true)) {
                         $this->applyFocus($sid);
-                        $this->openContextMenu($sid, $x, $y, $this->editMenuItems());
+                        $items = $this->spellMenuItems($sid, $node, $x, $y);
+                        $this->openContextMenu($sid, $x, $y, $items);
                     } elseif ($node->el->prop('contextMenu') !== null) {
                         $this->openContextMenu($sid, $x, $y);
                     }
@@ -956,6 +960,8 @@ final class Canvas implements Backend
         }
         if (isset($item['action'])) {
             $this->runEditAction($id, (string)$item['action']);
+        } elseif (isset($item['msg']) && str_starts_with((string)$item['msg'], 'spell:')) {
+            $this->runSpellAction($id, (string)$item['msg']);
         } elseif (isset($item['msg'])) {
             ($this->dispatch)((string)$item['msg']);
         }
@@ -985,6 +991,115 @@ final class Canvas implements Backend
             ['title' => 'Paste',      'action' => 'paste'],
             ['title' => 'Select All', 'action' => 'selectAll'],
         ];
+    }
+
+    /** Edit menu for a spellcheck-enabled field: if a misspelled word sits
+     *  under the pointer, prepend suggestion rows + Add/Ignore. */
+    private function spellMenuItems(string $id, Node $node, float $px, float $py): array
+    {
+        $items = $this->editMenuItems();
+        if (!$node->el->prop('spellcheck')) {
+            return $items;
+        }
+        $this->spellcheck();
+        $word = $this->spellWordAt($id, $node, $px, $py);
+        if ($word === null) {
+            return $items;
+        }
+        $pre = [];
+        foreach ($this->spellcheck()->suggest($word, 5) as $s) {
+            $pre[] = ['title' => $s, 'msg' => 'spell:replace:' . $word . ':' . $s];
+        }
+        $pre[] = ['title' => 'Add to dictionary', 'msg' => 'spell:add:' . $word];
+        $pre[] = ['title' => 'Ignore', 'msg' => 'spell:ignore:' . $word];
+        return array_merge($pre, $items);
+    }
+
+    /** Misspelled word under the pointer inside a field, or null. Geometry
+     *  mirrors drawSpellSquiggles: input/textarea text origin (+6,+4) with
+     *  line box top +2 and line height 18; search origin (+28, h/2-8). */
+    private function spellWordAt(string $id, Node $node, float $px, float $py): ?string
+    {
+        $buf = $this->fields[$id] ?? null;
+        $text = $buf['text'] ?? (string)$node->el->prop('text', '');
+        if ($text === '') {
+            return null;
+        }
+        $errors = $this->spellErrors($id, $text);
+        if ($errors === []) {
+            return null;
+        }
+        $ox = $node->type === 'search' ? $node->x + 28 : $node->x + 6;
+        $lineTop = $node->type === 'search' ? $node->y + $node->h / 2 - 6 : $node->y + 6;
+        $li = (int)floor(($py - $lineTop) / 18.0);
+        if ($li < 0) {
+            return null;
+        }
+        $lines = explode("\n", $text);
+        if ($li >= count($lines)) {
+            return null;
+        }
+        $lineStart = 0;
+        for ($i = 0; $i < $li; $i++) {
+            $lineStart += mb_strlen($lines[$i]) + 1;
+        }
+        $line = $lines[$li];
+        $lineEnd = $lineStart + mb_strlen($line);
+        foreach ($errors as $err) {
+            $segA = max($err['start'], $lineStart);
+            $segB = min($err['end'], $lineEnd);
+            if ($segA < $segB) {
+                $xa = $ox + (float)Cairo::measureExtents(mb_substr($line, 0, $segA - $lineStart), 13.0)['w'];
+                $xb = $ox + (float)Cairo::measureExtents(mb_substr($line, 0, $segB - $lineStart), 13.0)['w'];
+                if ($px >= $xa && $px <= $xb) {
+                    return $err['word'];
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Handle spell menu msgs: replace the word with a suggestion, add it to
+     *  the dictionary, or ignore it for the session. */
+    private function runSpellAction(string $id, string $msg): void
+    {
+        $parts = explode(':', $msg, 4);
+        if (count($parts) < 3) {
+            return;
+        }
+        $verb = $parts[1];
+        $word = $parts[2];
+        $engine = $this->spellcheck();
+        if ($verb === 'add') {
+            $engine->addToDictionary($word);
+        } elseif ($verb === 'ignore') {
+            $engine->ignore($word);
+        } elseif ($verb === 'replace' && isset($parts[3])) {
+            $buf = $this->fields[$id] ?? null;
+            $text = $buf['text'] ?? null;
+            if ($text === null) {
+                return;
+            }
+            $suggestion = $parts[3];
+            $newText = null;
+            foreach ($this->spellErrors($id, $text) as $err) {
+                if ($err['word'] === $word) {
+                    $newText = mb_substr($text, 0, $err['start'])
+                        . $suggestion
+                        . mb_substr($text, $err['end']);
+                    break;
+                }
+            }
+            if ($newText === null) {
+                $newText = (string)preg_replace('/' . preg_quote($word, '/') . '/u', $suggestion, $text, 1);
+            }
+            if ($newText !== $text) {
+                $this->setFieldText($id, $newText);
+                return;
+            }
+        }
+        // add/ignore keep the text, so the text-keyed cache would go stale.
+        unset($this->spellErrors[$id]);
     }
 
     private function drawContextMenu($cr, array $menu): void
@@ -2367,6 +2482,9 @@ final class Canvas implements Backend
             $this->drawFieldSelection($cr, $text, $buf['sel'], $buf['cursor'], $x, $y, $padX);
         }
         Cairo::text($cr, $x, $y + 12, $show, 13, $tc[0], $tc[1], $tc[2]);
+        if (!$n->el->prop('password') && $text !== '' && $n->el->prop('spellcheck')) {
+            $this->drawSpellSquiggles($cr, $id, $text, $x, $y, $padX);
+        }
         $this->drawComposition($cr, $n->el, $text, $x, $y + 12, $w);
         if ($buf !== null && $this->caretVisible()) {
             [$cx, $cy] = $this->fieldCaretXY($cr, $text, $buf['cursor'], $x, $y, $padX);
@@ -2407,6 +2525,58 @@ final class Canvas implements Backend
             }
             $pos = $lineEnd + 1;
         }
+    }
+
+    /** Draw red wavy underlines under misspelled words in a field's text.
+     *  $x/$y are the field's top-left (like drawFieldSelection); $padX mirrors
+     *  the selection x-offset so squiggles align with the drawn text. */
+    private function drawSpellSquiggles($cr, string $id, string $text, float $x, float $y, int $padX): void
+    {
+        if ($id === '' || $text === '') {
+            return;
+        }
+        $errors = $this->spellErrors($id, $text);
+        if ($errors === []) {
+            return;
+        }
+        $danger = $this->col('danger');
+        $lines = explode("\n", $text);
+        $pos = 0;
+        foreach ($lines as $i => $line) {
+            $lineStart = $pos;
+            $lineEnd = $pos + mb_strlen($line);
+            foreach ($errors as $err) {
+                $segA = max($err['start'], $lineStart);
+                $segB = min($err['end'], $lineEnd);
+                if ($segA < $segB) {
+                    $xa = $x + (float) Cairo::textExtents($cr, mb_substr($line, 0, $segA - $lineStart))['w'];
+                    $xb = $x + (float) Cairo::textExtents($cr, mb_substr($line, 0, $segB - $lineStart))['w'];
+                    $sy = $y + 2 + $i * 18 + 15;
+                    for ($sx = $xa; $sx < $xb - 1; $sx += 3.0) {
+                        $ex = min($sx + 3.0, $xb);
+                        $yy = $sy + (((int) (($sx - $xa) / 3.0) % 2 === 0) ? 0.0 : 1.0);
+                        Cairo::line($cr, $sx, $yy, $ex, $yy, $danger[0], $danger[1], $danger[2], 1.0);
+                    }
+                }
+            }
+            $pos = $lineEnd + 1;
+        }
+    }
+
+private function spellErrors(string $id, string $text): array
+{
+    $cached = $this->spellErrors[$id] ?? null;
+    if ($cached !== null && $cached['text'] === $text) {
+        return $cached['errors'];
+    }
+    $errors = $this->spellcheck()->errors($text);
+    $this->spellErrors[$id] = ['text' => $text, 'errors' => $errors];
+    return $errors;
+}
+
+    private function spellcheck(): \Yangweijie\Ui3\Spellcheck
+    {
+        return $this->spellcheck ??= new \Yangweijie\Ui3\Spellcheck();
     }
 
     /** Browse a list/select with arrows; Enter commits (list) / selects (both). */
@@ -3140,6 +3310,9 @@ final class Canvas implements Backend
         $tx = $x + 28;
         $ty = $y + $h / 2 + 4;
         Cairo::text($cr, $tx, $ty, $showPlaceholder ? (string) $el->prop('placeholder', '') : $text, 13, ...$tc);
+        if (!$showPlaceholder && $el->prop('spellcheck')) {
+            $this->drawSpellSquiggles($cr, $id, $text, $tx, $ty - 12, 0);
+        }
         $this->drawComposition($cr, $el, $text, $tx, $ty, $w - 34);
         if ($buf !== null) {
             if ($buf['sel'] !== $buf['cursor']) {

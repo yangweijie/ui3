@@ -20,6 +20,11 @@ typedef struct {
     cairo_surface_t *surface;
     Atom wm_delete;
 
+    /* Xdnd drag-and-drop support */
+    Atom xdnd_aware;
+    Atom xdnd_drop;
+    int  xdnd_dropping;   /* TRUE while waiting for XdndSelection reply */
+
     /* XI2 multitouch tracking for gesture detection */
     int xi2_opcode;
     struct { int id; int active; double x, y; } touches[10];
@@ -131,7 +136,12 @@ static void x11_dispatch(x11_plat *p, XEvent *ev)
                     if (!accept) break;
                 }
                 host->running = 0;
+            } else if (!x11_handle_xdnd(p, &ev->xclient)) {
+                /* ignore non-Xdnd, non-WM_DELETE_WINDOW client messages */
             }
+            break;
+        case SelectionNotify:
+            x11_handle_selection_notify(p, &ev->xselection);
             break;
         case GenericEvent:
         {
@@ -270,6 +280,122 @@ static void x11_handle_touch(x11_plat *p, XIDeviceEvent *e)
     }
 }
 
+/* ---- Xdnd drag-and-drop (version 5) ---- */
+
+/* Send XdndStatus reply to source: action = copy (1). */
+static void
+x11_xdnd_status(x11_plat *p, Window src, long x, long y, int action)
+{
+    XClientMessage msg;
+    msg.type = ClientMessage;
+    msg.message_type = p->xdnd_drop;
+    msg.display = p->dpy;
+    msg.window = src;
+    msg.format = 32;
+    msg.data.l[0] = p->win;
+    msg.data.l[1] = action;             /* XdndActionCopy = 1 */
+    msg.data.l[2] = (short)x << 16 | (short)y;
+    msg.data.l[3] = 0;                  /* rect length */
+    msg.data.l[4] = CurrentTime;
+    XSendEvent(p->dpy, src, False, NoEventMask, &msg);
+    XFlush(p->dpy);
+}
+
+static void
+x11_xdnd_request_files(x11_plat *p, Window src, long x, long y)
+{
+    p->xdnd_dropping = 1;
+
+    XClientMessage msg;
+    msg.type = ClientMessage;
+    msg.message_type = p->xdnd_drop;
+    msg.display = p->dpy;
+    msg.window = src;
+    msg.format = 32;
+    msg.data.l[0] = p->win;
+    msg.data.l[1] = CurrentTime;
+    msg.data.l[2] = 0;
+    msg.data.l[3] = 0;
+    msg.data.l[4] = 0;
+    XSendEvent(p->dpy, src, False, NoEventMask, &msg);
+
+    Atom xdnd_sel = XInternAtom(p->dpy, "XdndSelection", False);
+    XSelectionRequestEvent req;
+    req.type = SelectionRequest;
+    req.owner = src;
+    req.requestor = p->win;
+    req.selection = xdnd_sel;
+    req.target = XA_STRING;
+    req.property = XA_STRING;
+    req.time = CurrentTime;
+    XSendEvent(p->dpy, src, False, NoEventMask, (XEvent *)&req);
+    XFlush(p->dpy);
+}
+
+static int x11_handle_xdnd(x11_plat *p, XClientMessageEvent *ev)
+{
+    long *data = ev->data.l;
+    if (data[1] == 0) return 0;
+
+    switch ((int)data[1]) {
+        case 1:
+            x11_xdnd_status(p, ev->window, 0, 0, 1);
+            break;
+        case 2: {
+            int x = data[2] & 0xFFFF;
+            int y = (data[2] >> 16) & 0xFFFF;
+            x11_xdnd_status(p, ev->window, x, y, 1);
+            break;
+        }
+        case 3: {
+            long x = data[2] & 0xFFFF;
+            long y = (data[2] >> 16) & 0xFFFF;
+            x11_xdnd_request_files(p, ev->window, x, y);
+            break;
+        }
+        case 4:
+            p->xdnd_dropping = 0;
+            break;
+        default:
+            break;
+    }
+    return 1;
+}
+
+static void x11_handle_selection_notify(x11_plat *p, XSelectionEvent *ev)
+{
+    if (!p->xdnd_dropping) return;
+    if (ev->target != XA_STRING || ev->property == None) return;
+
+    char *data = NULL;
+    int nitems, remaining;
+    unsigned char type;
+    int fmt;
+    XGetWindowProperty(p->dpy, p->win, ev->property,
+                       0, 65536, False, AnyPropertyType,
+                       &type, &fmt, (unsigned char **)&data,
+                       &nitems, &remaining);
+
+    if (data && nitems > 0) {
+        data[nitems] = '\0';
+        x11_xdnd_deliver_drop(p, (char *)data, 0, 0);
+    }
+    if (data) XFree(data);
+    p->xdnd_dropping = 0;
+}
+
+static void x11_xdnd_deliver_drop(x11_plat *p, const char *files,
+                                  long x, long y)
+{
+    ui3_host *host = p->host;
+    if (!host->event_cb || !files) return;
+    double cx = (x > 0) ? x / host->scale : 0.0;
+    double cy = (y > 0) ? y / host->scale : 0.0;
+    char *payload = strdup(files);
+    host->event_cb(host->event_ctx, UI3_EVENT_DROP, cx, cy, 1.0, payload);
+    free(payload);
+}
+
 int ui3_plat_create_window(ui3_host *host, const char *title)
 {
     Display *dpy = XOpenDisplay(NULL);
@@ -292,14 +418,30 @@ int ui3_plat_create_window(ui3_host *host, const char *title)
     XMoveWindow(dpy, win, (sw - host->width) / 2, (sh - host->height) / 2);
 
     x11_plat *p = malloc(sizeof(*p));
+    memset(p, 0, sizeof(*p));
     p->host = host;
     p->dpy = dpy;
     p->win = win;
+    p->xdnd_aware = XInternAtom(dpy, "XdndAware", False);
+    p->xdnd_drop  = XInternAtom(dpy, "XdndDrop", False);
+    p->xdnd_dropping = 0;
     p->surface = cairo_xlib_surface_create(dpy, win,
                                            DefaultVisual(dpy, screen),
                                            host->width, host->height);
     p->wm_delete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(dpy, win, &p->wm_delete, 1);
+
+    /* Advertise as Xdnd drop target (version 5).
+     * types[0..2] are the target atoms we accept (XA_STRING = generic text);
+     * the source will send file:// URIs in this format. */
+    Atom xdnd_types[3] = {
+        XInternAtom(dpy, "text/plain", False),
+        XInternAtom(dpy, "text/uri-list", False),
+        XA_STRING
+    };
+    long xdnd_data[4] = { 5, xdnd_types[0], xdnd_types[1], xdnd_types[2] };
+    XChangeProperty(dpy, win, p->xdnd_aware, p->xdnd_aware, 32,
+                    PropModeReplace, (const unsigned char *)xdnd_data, 4);
 
     host->plat = p;
     host->scale = 1.0;
@@ -556,6 +698,11 @@ void ui3_plat_set_menu(ui3_host *host, const char *menu)
     (void)host; (void)menu;
 }
 
+/* The raw-X11 backend has no GtkWidget, so ATK/AT-SPI registration is
+ * impossible — ATKObject requires a GTK widget to attach to.  The tree is
+ * still serialised to text on host->last_a11y_tree (common.c) for headless
+ * / automation inspection via ui3_host_last_a11y().  A proper ATK bridge
+ * needs a GTK-based canvas widget; deferred until such a backend exists. */
 void ui3_plat_accessibility(ui3_host *host, ui3_a11y_node *root)
 {
     (void)host; (void)root;
@@ -589,6 +736,62 @@ char *ui3_host_get_clipboard_text(void *host)
 
 /* ---- Clipboard multi-format (P-Native P2) ---- */
 
+/* ---- Clipboard multi-format (P-Native P2) ----
+ *
+ * GTK3 multi-format clipboard: register target atoms + get-callbacks.
+ * The callbacks are invoked by GTK when another app requests data of a
+ * given atom.  We serve data from per-atom storage on the host struct.
+ *
+ * set_html / set_image: use gtk_clipboard_set_with_data with a callback
+ * that provides the data on demand and a cleanup callback that frees it.
+ *
+ * set_text / set_uris: already use gtk_clipboard_set_text (works fine).
+ *
+ * formats: query the clipboard's target list synchronously. */
+
+static void
+x11_clip_get_html(GtkClipboard *cb, GtkSelectionData *sd,
+                  guint info, gpointer data)
+{
+    (void)cb; (void)info;
+    char *html = data;
+    if (!html) return;
+    gtk_selection_data_set(sd,
+        gtk_selection_data_get_target(sd), 8,
+        (const guint8 *)html, strlen(html));
+}
+
+static void
+x11_clip_cleanup_html(gpointer data)
+{
+    free(data);
+}
+
+static void
+x11_clip_get_image(GtkClipboard *cb, GtkSelectionData *sd,
+                   guint info, gpointer data)
+{
+    (void)cb; (void)info;
+    x11_plat *p = (x11_plat *)data;
+    if (!p || !p->host) return;
+    const void *src = p->host->last_clip_image;
+    if (!src) return;
+    gtk_selection_data_set(sd,
+        gdk_atom_intern_static_string("image/png"), 8,
+        (const guint8 *)src, p->host->last_clip_image_len);
+}
+
+static void
+x11_clip_cleanup_image(gpointer data)
+{
+    x11_plat *p = (x11_plat *)data;
+    if (p && p->host) {
+        free(p->host->last_clip_image);
+        p->host->last_clip_image = NULL;
+        p->host->last_clip_image_len = 0;
+    }
+}
+
 void ui3_plat_clipboard_set_image(ui3_host *host, const void *data, int len)
 {
     if (host && host->headless) {
@@ -605,7 +808,21 @@ void ui3_plat_clipboard_set_image(ui3_host *host, const void *data, int len)
         }
         return;
     }
-    (void)data; (void)len;
+    if (!x11_ensure_gtk()) return;
+    if (!data || len <= 0) return;
+    GtkClipboard *cb = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    x11_plat *p = host ? host->plat : NULL;
+    if (!p) return;
+    free(p->host->last_clip_image);
+    p->host->last_clip_image = malloc(len);
+    if (p->host->last_clip_image)
+        memcpy(p->host->last_clip_image, data, len);
+    p->host->last_clip_image_len = len;
+    GdkAtom atom = gdk_atom_intern_static_string("image/png");
+    gtk_clipboard_set_with_data(cb, &atom, 1,
+                                x11_clip_get_image,
+                                x11_clip_cleanup_image,
+                                p);
 }
 
 const void *ui3_plat_clipboard_get_image(ui3_host *host, int *out_len)
@@ -617,10 +834,13 @@ const void *ui3_plat_clipboard_get_image(ui3_host *host, int *out_len)
     GdkAtom atom = gdk_atom_intern_static_string("image/png");
     GtkSelectionData *sd = gtk_clipboard_wait_for_contents(cb, atom);
     if (!sd || sd->length <= 0) { gtk_selection_data_free(sd); return NULL; }
-    if (out_len) *out_len = (int)sd->length;
-    const void *raw = sd->data;
+    void *data = malloc(sd->length);
+    if (data) {
+        memcpy(data, sd->data, sd->length);
+        if (out_len) *out_len = (int)sd->length;
+    }
     gtk_selection_data_free(sd);
-    return raw;
+    return data;
 }
 
 void ui3_plat_clipboard_set_uris(ui3_host *host, const char *uris)
@@ -649,19 +869,25 @@ const char *ui3_plat_clipboard_get_uris(ui3_host *host)
     return g;
 }
 
-void ui3_plat_clipboard_set_html(ui3_host *host, const char *html, const char *base_url)
+void ui3_plat_clipboard_set_html(ui3_host *host, const char *html,
+                                 const char *base_url)
 {
+    (void)base_url;
     if (host && host->headless) {
         free(host->last_clip_html);
         host->last_clip_html = html ? strdup(html) : NULL;
         return;
     }
-    (void)base_url;
     if (!html) return;
     if (!x11_ensure_gtk()) return;
+    char *stored = strdup(html);
+    if (!stored) return;
     GtkClipboard *cb = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
     GdkAtom atom = gdk_atom_intern_static_string("text/html");
-    gtk_clipboard_set_with_data(cb, &atom, NULL, NULL);
+    gtk_clipboard_set_with_data(cb, &atom, 1,
+                                x11_clip_get_html,
+                                x11_clip_cleanup_html,
+                                stored);
 }
 
 const char *ui3_plat_clipboard_get_html(ui3_host *host)
@@ -683,10 +909,28 @@ const char *ui3_plat_clipboard_get_html(ui3_host *host)
 int ui3_plat_clipboard_formats(ui3_host *host)
 {
     (void)host;
-    int m = 0;
     if (!x11_ensure_gtk()) return 0;
-    /* Headless stores own data; here we just report a safe minimal set. */
-    m |= UI3_CLIP_TEXT;
+    int m = 0;
+    GtkClipboard *cb = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    GdkAtomList *targets = gtk_clipboard_wait_for_targets(cb);
+    if (!targets) return 0;
+    for (GList *l = targets->atoms; l; l = l->next) {
+        const gchar *name = gdk_atom_name((GdkAtom)l->data);
+        if (!name) continue;
+        if (g_strcmp0(name, "UTF8_STRING") == 0 ||
+            g_strcmp0(name, "text/plain;charset=UTF-8") == 0 ||
+            g_strcmp0(name, "TEXT") == 0 ||
+            g_strcmp0(name, "STRING") == 0)
+            m |= UI3_CLIP_TEXT;
+        else if (g_strcmp0(name, "image/png") == 0)
+            m |= UI3_CLIP_IMAGE;
+        else if (g_strcmp0(name, "text/uri-list") == 0 ||
+                 g_strcmp0(name, "URI_LIST") == 0)
+            m |= UI3_CLIP_FILES;
+        else if (g_strcmp0(name, "text/html") == 0)
+            m |= UI3_CLIP_HTML;
+    }
+    gdk_atom_list_free(targets);
     return m;
 }
 

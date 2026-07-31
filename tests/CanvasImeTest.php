@@ -15,8 +15,6 @@ use Yangweijie\Ui3\Ui;
  *   2. The composition preview render is visible via offscreenPixels.
  *   3. App::composition routes correctly to Canvas.
  */
-// ---- State-level tests ----
-
 test('canvas stores and clears IME composition state', function () {
     $c = new Canvas(headless: true);
     $c->mount(Ui::window('F', [Ui::input('', 'type', null, 'field-1')]), static fn() => null);
@@ -35,12 +33,9 @@ test('canvas composition end is idempotent', function () {
     $c = new Canvas(headless: true);
     $c->mount(Ui::window('F', [Ui::input('', 'type', null, 'field-1')]), static fn() => null);
 
-    // Clearing a field that was never composed must not leave stale state.
     $c->composition('field-1', 'end', '');
     expect(compositionState($c, 'field-1'))->toBeNull();
 });
-
-// ---- Pixel-level tests (via offscreenPixels through the compositor) ----
 
 test('canvas composition preview renders via offscreenPixels', function () {
     $c = new Canvas(headless: true);
@@ -51,9 +46,8 @@ test('canvas composition preview renders via offscreenPixels', function () {
     $c->composition('field-1', 'update', 'あい');
     $after = $c->offscreenPixels();
 
-    // The preview text ('あい') rendered as accent-coloured underlined text
-    // must change the pixel output vs the empty-field state. Compare hashes
-    // to avoid PHPUnit exploding the 320x240 array on diff.
+    // Hashes, not direct array comparison: PHPUnit's diff on 320x240 pixel
+    // arrays exhausts memory and kills the PHP process.
     expect(md5(serialize($before['px'])))->not->toBe(md5(serialize($after['px'])));
 });
 
@@ -66,12 +60,8 @@ test('canvas composition end clears preview in pixels', function () {
     $c->composition('field-1', 'end', '');
     $cleared = $c->offscreenPixels();
 
-    // After composition end, the pixel output should match the original
-    // empty-field state (no preview residue).
     expect(md5(serialize($before['px'])))->toBe(md5(serialize($cleared['px'])));
 });
-
-// ---- End-to-end App::composition routing ----
 
 test('app composition routes to canvas and updates pixels', function () {
     $app = new App(
@@ -93,8 +83,6 @@ test('app composition routes to canvas and updates pixels', function () {
     expect($after['w'])->toBe(320);
     expect($after['h'])->toBe(240);
 });
-
-// ---- Helpers ----
 
 /**
  * @return array{phase:string,text:string}|null

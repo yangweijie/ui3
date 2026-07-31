@@ -117,15 +117,15 @@ test('field shows the typed value, not the placeholder', function () {
 
 /**
  * P0.1 — selection by Shift+Arrow, then typing replaces the selection.
- * rawKey(123, true) carries the Shift modifier through ui3_key_text, which now
+ * rawKey(123, 1) carries the Shift modifier through ui3_key_text, which now
  * emits the "\x11" (KEY_SHIFT_LEFT) token so the editor can extend a selection.
  */
 test('Shift+Arrow selects and typing replaces the selection', function () {
     $auto = (new Automation(editApp(), new Canvas(headless: true)))->start();
     $auto->focus('v-input');
     $auto->type('hello');                 // cursor at 5
-    $auto->rawKey(123, true);             // Shift+Left -> selection [4,5]
-    $auto->rawKey(123, true);             // Shift+Left -> selection [3,5]
+    $auto->rawKey(123, 1);             // Shift+Left -> selection [4,5]
+    $auto->rawKey(123, 1);             // Shift+Left -> selection [3,5]
     expect($auto->backend()->fieldSelectionRange('v-input'))->toBe([3, 5]);
 
     $auto->type('XY');                    // replaces "lo" -> "helXY"

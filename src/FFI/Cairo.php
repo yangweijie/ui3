@@ -48,6 +48,10 @@ void cairo_new_path(cairo_t* cr);
 void cairo_close_path(cairo_t* cr);
 void cairo_arc(cairo_t* cr, double xc, double yc, double radius, double angle1, double angle2);
 void cairo_clip(cairo_t* cr);
+void cairo_paint(cairo_t* cr);
+void cairo_set_source_surface(cairo_t* cr, cairo_surface_t* surface, double x, double y);
+void cairo_surface_mark_dirty_rectangle(cairo_surface_t* surface, int x, int y, int width, int height);
+cairo_surface_t* cairo_get_target(cairo_t* cr);
 void cairo_surface_flush(cairo_surface_t* surface);
 unsigned char* cairo_image_surface_get_data(cairo_surface_t* surface);
 int cairo_image_surface_get_width(cairo_surface_t* surface);
@@ -181,10 +185,10 @@ C;
         };
     }
 
-    public static function text($cr, float $x, float $y, string $text, float $size, float $r, float $g, float $b, ?string $family = null): void
+    public static function text($cr, float $x, float $y, string $text, float $size, float $r, float $g, float $b, ?string $family = null, int $weight = 0, int $slant = 0): void
     {
         $f = self::ffi();
-        $f->cairo_select_font_face($cr, $family ?? self::defaultFamily(), 0, 0);
+        $f->cairo_select_font_face($cr, $family ?? self::defaultFamily(), $slant, $weight);
         $f->cairo_set_font_size($cr, $size);
         $f->cairo_set_source_rgb($cr, $r, $g, $b);
         $f->cairo_move_to($cr, $x, $y);
@@ -192,14 +196,14 @@ C;
     }
 
     /** Measure text with real cairo_text_extents (replaces width estimates). */
-    public static function measureText(string $text, float $size, ?string $family = null): array
+    public static function measureText(string $text, float $size, ?string $family = null, int $weight = 0, int $slant = 0): array
     {
         $cr = self::measureCr();
         if ($cr === null) {
             return ['w' => mb_strlen($text) * $size * 0.55, 'h' => (int)($size * 1.4)];
         }
         $f = self::ffi();
-        $f->cairo_select_font_face($cr, $family ?? self::defaultFamily(), 0, 0);
+        $f->cairo_select_font_face($cr, $family ?? self::defaultFamily(), $slant, $weight);
         $f->cairo_set_font_size($cr, $size);
         $ext = $f->new('cairo_text_extents_t');
         $f->cairo_text_extents($cr, $text, \FFI::addr($ext));
@@ -207,6 +211,36 @@ C;
             'w' => (float) $ext->x_advance,
             'h' => $ext->height > 0 ? (float) $ext->height : (float) $size * 1.2,
         ];
+    }
+
+    /**
+     * Set the source pattern to the given surface. Used by the compositor
+     * to blit the backing surface to the host cr.
+     */
+    public static function setSourceSurface($cr, $surface, float $x, float $y): void
+    {
+        self::ffi()->cairo_set_source_surface($cr, $surface, $x, $y);
+    }
+
+    /**
+     * Paint the current source (surface / pattern) to the destination.
+     * Used after cairo_set_source_surface to blit a backing surface.
+     */
+    public static function paint($cr): void
+    {
+        self::ffi()->cairo_paint($cr);
+    }
+
+    /** Return the surface associated with a cairo context. */
+    public static function getTarget($cr)
+    {
+        return self::ffi()->cairo_get_target($cr);
+    }
+
+    /** Notify cairo that a rectangular region of the surface has been modified. */
+    public static function surfaceMarkDirtyRectangle($surface, int $x, int $y, int $w, int $h): void
+    {
+        self::ffi()->cairo_surface_mark_dirty_rectangle($surface, $x, $y, $w, $h);
     }
 
     public static function pushGroup($cr): void

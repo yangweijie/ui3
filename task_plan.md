@@ -165,8 +165,49 @@
 - [x] `ContextMenuTest` +3（多级嵌套/深层点击/icon+checked）；`Ui::contextMenu` 补条目结构 docblock
 - Status: done
 
+### P-Native P0: 修饰键 + Cmd 捕获（最小验证，done）
+- [x] `libui3.h`：新增 `UI3_MOD_*` 位定义；`ui3_host_inject_raw_key`/`post_key` 参数 `shift`→`modifiers`
+- [x] `common.c`：`ui3_key_text(keycode, modifiers, chars)` 统一生成 "Shift+/Ctrl+/Alt+/Cmd+" 前缀（Cocoa/Win32/X11/headless 一致）
+- [x] `cocoa.m`：routeKey 计算 shift/ctrl/alt/cmd 四位；`performKeyEquivalent` 把 Cmd+* 路由到 PHP（保留 Cmd+Q/W/H/M/Tab/Space/` 给系统）
+- [x] `win32.c`/`x11.c`：onKey 计算四位修饰键；WM_CHAR 把 Ctrl+letter 控制符还原为 "Ctrl+<letter>"
+- [x] `Canvas.php`：`onKey`/`editText` 接收修饰位掩码；Ctrl/Cmd 触发 copy/paste/cut/selectAll/undo/redo（Alt/Cmd 组合亦透传，如 Ctrl+Alt+A）
+- [x] `Automation::rawKey` 参数 `shift`→`modifiers`（向后兼容：`true`==SHIFT）
+- [x] `tests/ModifierShortcutTest.php`：Cmd/Alt 组合端到端验证
+- Status: done（最小验证通过）
+
+### P-Native P0 (续): 多窗口 / 窗口管理 API
+- [x] 窗口管理 ABI：`setTitle/resize/minimize/close/title/closed` + `width/height` 已落地（Cocoa/Win32/X11 三端 `ui3_plat_*` + headless 状态一致）；`Canvas`/`App` 暴露并测试（`tests/WindowManageTest.php` ×4，headless 验证 title/closed/width/height）
+- [x] 修复 `ui3_host_create` 未存储初始标题的 bug（view 标题现生效）
+- [x] 多窗口（真·OS 多 surface）：`ui3_host_create` 多实例 + `App::openWindow` 真正开第二个 OS 窗口（Canvas `createExtraHost/destroyExtraHost` + App 代理 + 9 headless 测试，192 total passed）
+- [x] 窗口管理剩余项：move / fullscreen / acceptClose（C ABI + 3 platform + PHP + 5 tests，182 total passed）
+- Status: P-Native P0 续 全部 done（窗口管理 + 多窗口均已落地）
+
+### P-Native P1: 系统集成分层（菜单栏/托盘/DnD/手势/对话框/通知/无障碍树）
+- [x] 原生菜单栏（NSMenu/系统顶栏）+ 状态栏 + 托盘（dock menu）
+  - 2026-07-30: `ui3_host_set_menu`（文本协议）+ `UI3_EVENT_MENU` + `click_menu`；cocoa NSMenu（keyEquivalent）/ win32 HMENU（WM_COMMAND 映射）/ x11 no-op；`Ui::appMenu/appMenuItem/appMenuSeparator` + window `menu:` + Automation `clickMenu` + 3 headless 测试；状态栏/托盘/dock menu 待补
+- [x] 拖放 DnD（文件/文本/图片/URL）
+  - 2026-07-30: `UI3_EVENT_DROP` + `ui3_host_inject_drop`；cocoa performDragOperation（文件/文本）/ win32 WM_DROPFILES（文件）/ x11 缺（raw-X11 无 XDND）；window `onDrop` + Automation `drop()` + 3 headless 测试；图片/URL/x11 待补
+- [x] OS 级手势（pinch/rotate/swipe/pan momentum）
+  - 2026-07-30: Cocoa (magnify/rotate/swipe/scrollWheel momentum), Win32 (WM_GESTURE API: zoom→pinch/rotate/pan/tap→swipe), X11 (XI2 TouchBegin/Update/End + 2-finger pinch distance/angle math + pan); 4 headless tests via injectGesture（192 total passed）
+- [x] 原生对话框（alert/sheet/color/font/print/about）；当前仅 open/save 文件
+  - 2026-07-30: alert/confirm/sheet/about 已打通（C `ui3_host_dialog` + cocoa NSAlert / win32 MessageBoxW / x11 GtkMessageDialog + headless 预设结果 + lastDialog 记录 + 5 headless 测试）；color/font/print 待补
+- [x] 通知中心（UNUserNotification / toast / libnotify）
+  - 2026-07-30: `ui3_host_notify` 打通；cocoa NSUserNotificationCenter / x11 notify-send / win32 best-effort no-op；headless lastNotify 记录 + 3 测试；win32 WinRT toast 待补
+- [x] 原生无障碍树桥接（NSAccessibility / UIA / AT-SPI）
+  - 2026-07-30: `ui3_host_set_a11y_text` 文本协议 + `flattenA11yTree`（PHP→tab-delimited text→C 解析）；C `ui3_a11y_node` 树 + `ui3_host_set_a11y_tree` deep copy + headless 序列化 + `ui3_host_last_a11y` 回读；cocoa NSAccessibility（Ui3View/Ui3A11yElement accessibilityChildren/Label/Description）/ win32 UIA stub（deferred）/ x11 ATK stub（deferred）；5 headless 测试（text output/nested elements/root metadata/role mapping/non-accessible group）
+- Status: P-Native P1 done（菜单栏/DnD/手势/对话框/通知/无障碍树全部落地；win32 UIA / x11 ATK 完整桥接 deferred）
+
+### P-Native P2: 编辑/剪贴板/性能/后端覆盖
+- [x] 富文本（bold/italic/underline/fontSize color 标签 prop → Cairo slant/weight + underline + fontSize 透传）
+- [x] 剪贴板多格式（图片/RTF/fileURL）
+  - 2026-07-30: `ui3_host_set/get_clipboard_image`（PNG bytes）、`set/get_clipboard_uris`（file:// URLs）、`set/get_clipboard_html`、`clipboard_formats`（UI3_CLIP_TEXT/IMAGE/FILES/HTML bitmask）；C ABI + common.c shared wrappers（headless 存 `last_clip_*` 字段）+ cocoa NSPasteboard（public.png / NSFilenamesPboardType / com.apple.html）+ win32 HTML Format（image/uris deferred）+ x11 GTK stubs；Canvas.php 7 个方法（setImage/getImage/setUris/getUris/setHtml/getHtml/formats）；5 headless 测试全部通过；Bug fix：`nativeClipboard()` 原本 `!$this->isHeadless()` 阻塞 headless 调用→改为 `$this->host !== null`；`ui3_host_set_clipboard_text` 平台函数未存 `last_clip_text`→三平台加 headless 存储
+- [x] compositor / GPU 层 / 局部重绘
+- [ ] Wayland / GTK4 / 移动端 / 真 WebView
+- Status: 剪贴板多格式 done（cocoa 全格式；win32 HTML 工作，image/uris deferred；x11 GTK stubs deferred）；富文本 done（bold/italic/underline/fontSize 标签 prop → Cairo + 5 回归测试）；compositor done（backing surface + dirty rect + partial blit + 16 unit tests）；拼写检查/IME 完整性/Wayland 仍 pending
+
 ## All phases complete
 十个方向全部补齐：主题/令牌、布局引擎、缺失组件、动画、事件/输入、状态/响应式、无障碍、多窗口、Web 目标、其他系统。P0–P1 渲染底座、动画/文本/IME 成熟度、scroll 裁剪与交互、文本编辑原语/剪切板/文件对话框、右键菜单增强与多级嵌套/图标/勾选态均已落地。
+另开 **P-Native（Native SDK Parity）** 跟踪块，对标 OS 原生 GUI SDK 补齐系统集成深度（P0 修饰键/Cmd 捕获、多窗口/窗口管理、菜单栏/托盘/DnD/手势/对话框/通知/无障碍树均 done；P2 剪贴板多格式 done（cocoa 全格式，win32 HTML 工作，image/uris/x11 GTK stubs deferred）；富文本 done（bold/italic/underline/fontSize 标签 prop → Cairo 渲染 + 5 回归测试）；compositor done（backing surface + dirty rect + partial blit + 16 单元测试）；拼写检查/IME 完整性/Wayland 等按 P2 推进）。
 
 ## Key Decisions
 - 每方向三层(DSL+Canvas+自动化)最小实现，可被 MCP 观测。

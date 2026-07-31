@@ -15,6 +15,17 @@ typedef struct {
 @end
 
 @implementation Ui3Delegate
+- (BOOL)windowShouldClose:(NSNotification *)n
+{
+    if (!self.host) return YES;
+    if (self.host->close_cb) {
+        int accept = 1;
+        self.host->close_cb(self.host->close_ctx, &accept);
+        if (!accept) return NO;
+    }
+    return YES;
+}
+
 - (void)windowWillClose:(NSNotification *)n
 {
     if (self.host) self.host->running = 0;
@@ -53,6 +64,10 @@ static void cocoa_paint(ui3_host *host, CGContextRef cg)
 
 @interface Ui3View : NSView
 @property ui3_host *host;
+@end
+
+@interface Ui3A11yElement : NSAccessibilityElement
+- (instancetype)initWithNode:(const ui3_a11y_node *)node;
 @end
 
 @implementation Ui3View
@@ -101,8 +116,147 @@ static void cocoa_paint(ui3_host *host, CGContextRef cg)
     // data > 0 == scroll down (viewport offset increases). Cocoa reports a
     // downward physical scroll as a negative deltaY, so negate.
     host->event_cb(host->event_ctx, UI3_EVENT_WHEEL, p.x, p.y, -[e scrollingDeltaY], NULL);
+
+    /* Pan momentum (P-Native P1): when a trackpad two-finger pan gesture is
+     * active (phase != None), also deliver a GESTURE event with gtype=3 (pan).
+     * Text = "dx,dy" for 2D panning. This fires alongside the WHEEL event so
+     * scroll containers still work, while gesture targets get pan data. */
+    if ([e phase] != NSEventPhaseNone || [e momentumPhase] != NSEventPhaseNone) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%f,%f", [e scrollingDeltaX], [e scrollingDeltaY]);
+        host->event_cb(host->event_ctx, UI3_EVENT_GESTURE, p.x, p.y, 3, buf);
+    }
 }
 
+/* Drag & drop (P-Native P1): deliver a DROP event with the payload — file
+ * paths (newline-separated, dtype=1) when URLs are dropped, else the text
+ * (dtype=0). */
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
+    return NSDragOperationCopy;
+}
+- (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)sender {
+    return NSDragOperationCopy;
+}
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+    ui3_host *host = self.host;
+    if (!host || !host->event_cb) return NO;
+    NSPoint p = [self convertPoint:[sender draggingLocation] fromView:nil];
+    NSPasteboard *pb = [sender draggingPasteboard];
+    NSString *payload = nil;
+    int dtype = 0;
+    NSArray<NSURL *> *urls = [pb readObjectsForClasses:@[[NSURL class]] options:nil];
+    if (urls.count > 0) {
+        NSMutableArray<NSString *> *paths = [NSMutableArray array];
+        for (NSURL *u in urls) {
+            if (u.isFileURL) [paths addObject:[u path]];
+        }
+        if (paths.count > 0) {
+            payload = [paths componentsJoinedByString:@"\n"];
+            dtype = 1;
+        }
+    }
+    if (!payload) {
+        NSString *s = [pb stringForType:NSPasteboardTypeString];
+        if (s) { payload = s; dtype = 0; }
+    }
+    if (!payload) return NO;
+    host->event_cb(host->event_ctx, UI3_EVENT_DROP, p.x, p.y, (double)dtype, [payload UTF8String]);
+    return YES;
+}
+
+/* Trackpad gestures (P-Native P1): deliver GESTURE events — pinch (magnify),
+ * rotate, swipe — at the gesture location. data = 0/1/2, text = magnitude/dir. */
+- (void)magnifyWithEvent:(NSEvent *)e {
+    ui3_host *host = self.host;
+    if (!host || !host->event_cb) return;
+    NSPoint p = [self convertPoint:[e locationInWindow] fromView:nil];
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%f", [e magnification]);
+    host->event_cb(host->event_ctx, UI3_EVENT_GESTURE, p.x, p.y, 0, buf);
+}
+- (void)rotateWithEvent:(NSEvent *)e {
+    ui3_host *host = self.host;
+    if (!host || !host->event_cb) return;
+    NSPoint p = [self convertPoint:[e locationInWindow] fromView:nil];
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%f", [e rotation]);
+    host->event_cb(host->event_ctx, UI3_EVENT_GESTURE, p.x, p.y, 1, buf);
+}
+- (void)swipeWithEvent:(NSEvent *)e {
+    ui3_host *host = self.host;
+    if (!host || !host->event_cb) return;
+    NSPoint p = [self convertPoint:[e locationInWindow] fromView:nil];
+    const char *dir = "right";
+    if (e.deltaX < -0.5) dir = "left";
+    else if (e.deltaY > 0.5) dir = "up";
+    else if (e.deltaY < -0.5) dir = "down";
+    host->event_cb(host->event_ctx, UI3_EVENT_GESTURE, p.x, p.y, 2, dir);
+}
+
+- (NSArray<id<NSAccessibility>> *)accessibilityChildren
+{
+    ui3_host *host = self.host;
+    if (!host || !host->plat_a11y) return @[];
+    ui3_a11y_node *root = (ui3_a11y_node *)host->plat_a11y;
+    NSMutableArray *children = [NSMutableArray array];
+    for (int i = 0; i < root->child_count; i++) {
+        Ui3A11yElement *el = [[Ui3A11yElement alloc] initWithNode:root->children[i]];
+        [children addObject:el];
+    }
+    return children;
+}
+- (NSString *)accessibilityLabel
+{
+    ui3_host *host = self.host;
+    if (!host || !host->plat_a11y) return nil;
+    const char *l = ((ui3_a11y_node *)host->plat_a11y)->label;
+    return l && l[0] ? [NSString stringWithUTF8String:l] : nil;
+}
+- (NSString *)accessibilityDescription
+{
+    ui3_host *host = self.host;
+    if (!host || !host->plat_a11y) return nil;
+    const char *d = ((ui3_a11y_node *)host->plat_a11y)->description;
+    return d && d[0] ? [NSString stringWithUTF8String:d] : nil;
+}
+
+@end
+
+@implementation Ui3A11yElement {
+    const ui3_a11y_node *_node;
+}
+- (instancetype)initWithNode:(const ui3_a11y_node *)node
+{
+    self = [super init];
+    if (self) { _node = node; }
+    return self;
+}
+- (NSArray<id<NSAccessibility>> *)accessibilityChildren
+{
+    if (!_node || _node->child_count == 0) return @[];
+    NSMutableArray *arr = [NSMutableArray arrayWithCapacity:_node->child_count];
+    for (int i = 0; i < _node->child_count; i++) {
+        Ui3A11yElement *el = [[Ui3A11yElement alloc] initWithNode:_node->children[i]];
+        [arr addObject:el];
+    }
+    return arr;
+}
+- (NSString *)accessibilityLabel
+{
+    if (!_node || !_node->label || !_node->label[0]) return nil;
+    return [NSString stringWithUTF8String:_node->label];
+}
+- (NSString *)accessibilityDescription
+{
+    if (!_node || !_node->description || !_node->description[0]) return nil;
+    return [NSString stringWithUTF8String:_node->description];
+}
+- (NSRect)accessibilityFrame
+{
+    if (!_node) return NSZeroRect;
+    return NSMakeRect(_node->x, _node->y, _node->w, _node->h);
+}
+- (id<NSAccessibility>)accessibilityParentElement { return nil; }
 @end
 
 /* Key handling lives at the WINDOW level, not the content view: a custom
@@ -115,47 +269,61 @@ static void cocoa_paint(ui3_host *host, CGContextRef cg)
 - (void)routeKey:(NSEvent *)e;
 @end
 
+/* Menu bar target (P-Native P1): receives menu-item clicks and delivers a
+ * UI3_EVENT_MENU carrying the item's onClick message. */
+@interface Ui3MenuTarget : NSObject
+@property ui3_host *host;
+- (void)click:(NSMenuItem *)sender;
+@end
+
+@implementation Ui3MenuTarget
+- (void)click:(NSMenuItem *)sender
+{
+    ui3_host *host = self.host;
+    if (!host || !host->event_cb) return;
+    NSString *msg = sender.representedObject;
+    if (!msg || msg.length == 0) return;
+    host->event_cb(host->event_ctx, UI3_EVENT_MENU, 0, 0, 0, [msg UTF8String]);
+}
+@end
+
 @implementation Ui3Window
 
 - (void)routeKey:(NSEvent *)e
 {
     ui3_host *host = self.host;
     if (!host || !host->event_cb) return;
-    int shift = (e.modifierFlags & NSEventModifierFlagShift) ? 1 : 0;
-    int ctrl  = (e.modifierFlags & NSEventModifierFlagControl) ? 1 : 0;
+    int shift = (e.modifierFlags & NSEventModifierFlagShift)    ? UI3_MOD_SHIFT : 0;
+    int ctrl  = (e.modifierFlags & NSEventModifierFlagControl)  ? UI3_MOD_CTRL  : 0;
+    int alt   = (e.modifierFlags & NSEventModifierFlagOption)   ? UI3_MOD_ALT   : 0;
+    int cmd   = (e.modifierFlags & NSEventModifierFlagCommand)  ? UI3_MOD_CMD   : 0;
+    int modifiers = shift | ctrl | alt | cmd;
     const char *chars = [e.characters UTF8String];
     /* Ctrl combos: -characters carries a control char (e.g. "\x01" for Ctrl+A);
      * use the unmodified base so we emit "Ctrl+a" not "Ctrl+\x01". */
     if (ctrl && chars && chars[0] && (unsigned char)chars[0] < 0x20) {
         chars = [e.charactersIgnoringModifiers UTF8String];
     }
-    char *text = ui3_key_text((int)e.keyCode, shift, chars);
+    char *text = ui3_key_text((int)e.keyCode, modifiers, chars);
     if (!text) return;
-    /* Prefix printable keys with "Ctrl+" so PHP can bind shortcuts (P0.1). */
-    if (ctrl && text[0] && (unsigned char)text[0] >= 0x20 && text[0] != '\t') {
-        size_t L = strlen(text);
-        char *ct = (char *)malloc(L + 6);
-        if (ct) {
-            memcpy(ct, "Ctrl+", 5);
-            memcpy(ct + 5, text, L + 1);
-            free(text);
-            text = ct;
-        }
-    }
-    host->event_cb(host->event_ctx, UI3_EVENT_KEY, 0, 0, 0, text);
+    host->event_cb(host->event_ctx, UI3_EVENT_KEY, 0, 0, (double)modifiers, text);
     free(text);
 }
 
 - (void)keyDown:(NSEvent *)e { [self routeKey:e]; }
 - (BOOL)performKeyEquivalent:(NSEvent *)e
 {
-    /* Claim only keys we actually route (Tab/arrows/Enter/Backspace/printable);
-     * let genuine app key-equivalents (Cmd+Q, Cmd+W, ...) fall through to the
-     * system so they keep working. */
-    int shift = (e.modifierFlags & NSEventModifierFlagShift) ? 1 : 0;
-    char *text = ui3_key_text((int)e.keyCode, shift, [e.characters UTF8String]);
-    if (text) { free(text); [self routeKey:e]; return YES; }
-    return [super performKeyEquivalent:e];
+    /* Route Cmd+* combos to PHP so app shortcuts (Cmd+C/V/X/Z/A, …) are
+     * capturable. Keep the system's reserved app/window shortcuts falling
+     * through to macOS (quit/close/hide/minimize/switch/spotlight/cycle). */
+    if ((e.modifierFlags & NSEventModifierFlagCommand) &&
+        ((int)e.keyCode == 12 || (int)e.keyCode == 13 || (int)e.keyCode == 4 ||
+         (int)e.keyCode == 46 || (int)e.keyCode == 48 || (int)e.keyCode == 49 ||
+         (int)e.keyCode == 50)) {
+        return [super performKeyEquivalent:e];
+    }
+    [self routeKey:e];
+    return YES;
 }
 
 @end
@@ -179,6 +347,7 @@ int ui3_plat_create_window(ui3_host *host, const char *title)
 
         Ui3View *view = [[Ui3View alloc] initWithFrame:rect];
         view.host = host;
+        [view registerForDraggedTypes:@[NSPasteboardTypeFileURL, NSPasteboardTypeString]];
         win.contentView = view;
 
         Ui3Delegate *delegate = [[Ui3Delegate alloc] init];
@@ -233,16 +402,21 @@ void ui3_plat_present(ui3_host *host)
 /* Verify/automate the real key path: build a genuine NSEvent and hand it to the
  * window's keyDown:, exercising the exact routeKey/event_cb chain that physical
  * typing uses (so automation can test it without a human). */
-void ui3_plat_post_key(ui3_host *host, int keycode, int shift, const char *chars)
+void ui3_plat_post_key(ui3_host *host, int keycode, int modifiers, const char *chars)
 {
     cocoa_plat *p = host->plat;
     if (!p) return;
     Ui3Window *win = (__bridge Ui3Window *)(p->win);
     if (!win) return;
     NSString *s = [NSString stringWithUTF8String:chars ? chars : ""];
+    NSEventModifierFlags mf = 0;
+    if (modifiers & UI3_MOD_SHIFT) mf |= NSEventModifierFlagShift;
+    if (modifiers & UI3_MOD_CTRL)  mf |= NSEventModifierFlagControl;
+    if (modifiers & UI3_MOD_ALT)   mf |= NSEventModifierFlagOption;
+    if (modifiers & UI3_MOD_CMD)   mf |= NSEventModifierFlagCommand;
     NSEvent *e = [NSEvent keyEventWithType:NSEventTypeKeyDown
                                     location:NSZeroPoint
-                               modifierFlags:shift ? NSEventModifierFlagShift : 0
+                               modifierFlags:mf
                                    timestamp:0
                                 windowNumber:win.windowNumber
                                      context:nil
@@ -283,11 +457,337 @@ void ui3_plat_destroy(ui3_host *host)
     host->plat = NULL;
 }
 
+/* ---- Window management (P1) ---- */
+void ui3_plat_set_title(ui3_host *host, const char *title)
+{
+    if (!host || !host->plat) return;
+    cocoa_plat *p = host->plat;
+    Ui3Window *win = (__bridge Ui3Window *)(p->win);
+    if (!win) return;
+    [win setTitle:[NSString stringWithUTF8String:title ? title : "App"]];
+}
+
+void ui3_plat_resize(ui3_host *host, int w, int h)
+{
+    if (!host || !host->plat) return;
+    cocoa_plat *p = host->plat;
+    Ui3Window *win = (__bridge Ui3Window *)(p->win);
+    if (!win) return;
+    [win setContentSize:NSMakeSize((CGFloat)w, (CGFloat)h)];
+}
+
+void ui3_plat_minimize(ui3_host *host)
+{
+    if (!host || !host->plat) return;
+    cocoa_plat *p = host->plat;
+    Ui3Window *win = (__bridge Ui3Window *)(p->win);
+    if (!win) return;
+    [win miniaturize:nil];
+}
+
+void ui3_plat_close(ui3_host *host)
+{
+    if (!host || !host->plat) return;
+    cocoa_plat *p = host->plat;
+    Ui3Window *win = (__bridge Ui3Window *)(p->win);
+    if (!win) return;
+    [win close];
+}
+
+void ui3_plat_move(ui3_host *host, int x, int y)
+{
+    if (!host || !host->plat) return;
+    cocoa_plat *p = host->plat;
+    Ui3Window *win = (__bridge Ui3Window *)(p->win);
+    if (!win) return;
+    NSRect frame = [win frame];
+    frame.origin.x = (CGFloat)x;
+    frame.origin.y = (CGFloat)y;
+    [win setFrameOrigin:frame.origin];
+}
+
+void ui3_plat_fullscreen(ui3_host *host)
+{
+    if (!host || !host->plat) return;
+    cocoa_plat *p = host->plat;
+    Ui3Window *win = (__bridge Ui3Window *)(p->win);
+    if (!win) return;
+    [win toggleFullScreen:nil];
+}
+
+/* ---- Native modal dialogs (P-Native P1) ---- */
+int ui3_plat_dialog(ui3_host *host, int kind, int style, const char *title,
+                    const char *message, const char *buttons)
+{
+    if (!host || !host->plat) return -1;
+    cocoa_plat *p = host->plat;
+    Ui3Window *win = (__bridge Ui3Window *)(p->win);
+    if (!win) return -1;
+
+    __block NSInteger clicked = -1;
+    void (^show)(void) = ^{
+        NSAlert *alert = [[NSAlert alloc] init];
+        NSAlertStyle st = NSAlertStyleInformational;
+        if (kind == 1) st = NSAlertStyleWarning;
+        else if (kind == 2) st = NSAlertStyleCritical;
+        alert.alertStyle = st;
+        alert.messageText = [NSString stringWithUTF8String:title ? title : ""];
+        alert.informativeText = [NSString stringWithUTF8String:message ? message : ""];
+
+        NSString *bstr = [NSString stringWithUTF8String:buttons ? buttons : "OK"];
+        NSArray<NSString *> *labels = [bstr componentsSeparatedByString:@"|"];
+        for (NSString *label in labels) {
+            if (label.length == 0) continue;
+            [alert addButtonWithTitle:label];
+        }
+
+        if (style == 1) {
+            [alert beginSheetModalForWindow:win
+                          completionHandler:^(NSModalResponse r) {
+                              clicked = r - NSAlertFirstButtonReturn;
+                          }];
+            while (clicked < 0) {
+                @autoreleasepool {
+                    [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                                             beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+                }
+            }
+        } else {
+            clicked = [alert runModal] - NSAlertFirstButtonReturn;
+        }
+    };
+
+    if ([NSThread isMainThread]) show();
+    else dispatch_sync(dispatch_get_main_queue(), show);
+    return (int)clicked;
+}
+
+/* ---- Native notification / toast (P-Native P1) ---- */
+int ui3_plat_notify(ui3_host *host, const char *title, const char *body)
+{
+    (void)host;
+    @autoreleasepool {
+        NSUserNotification *n = [[NSUserNotification alloc] init];
+        n.title = [NSString stringWithUTF8String:title ? title : ""];
+        n.informativeText = [NSString stringWithUTF8String:body ? body : ""];
+        n.soundName = NSUserNotificationDefaultSoundName;
+        [[NSUserNotificationCenter defaultUserNotificationCenter] deliverNotification:n];
+    }
+    return 0;
+}
+
+/* ---- Native menu bar (P-Native P1) ---- */
+/* Parse the encoded menu text and build the application main menu. Each
+ * top-level line is a menu title; tab-indented "\t<label>\t<onClick>\t<shortcut>"
+ * lines are items ("\t-" = separator). Shortcuts use "Cmd+O" / "Ctrl+Shift+S"
+ * syntax (last token = keyEquivalent, prefixes = modifier mask). */
+void ui3_plat_set_menu(ui3_host *host, const char *menu)
+{
+    if (!host || !menu) return;
+    Ui3MenuTarget *target = [[Ui3MenuTarget alloc] init];
+    target.host = host;
+
+    void (^build)(void) = ^{
+        NSMenu *root = [[NSMenu alloc] init];
+        NSMenu *current = nil;
+        NSString *all = [NSString stringWithUTF8String:menu];
+        for (NSString *line in [all componentsSeparatedByString:@"\n"]) {
+            if ([line hasPrefix:@"\t"]) {
+                if (!current) continue;
+                NSArray<NSString *> *f = [[line substringFromIndex:1] componentsSeparatedByString:@"\t"];
+                NSString *label = f.count > 0 ? f[0] : @"";
+                if ([label isEqualToString:@"-"]) {
+                    [current addItem:[NSMenuItem separatorItem]];
+                    continue;
+                }
+                NSString *onClick = f.count > 1 ? f[1] : @"";
+                NSString *shortcut = f.count > 2 ? f[2] : @"";
+                NSString *key = @"";
+                NSEventModifierFlags mask = 0;
+                if (shortcut.length > 0) {
+                    NSArray<NSString *> *parts = [shortcut componentsSeparatedByString:@"+"];
+                    key = parts.lastObject;
+                    for (NSUInteger i = 0; i + 1 < parts.count; i++) {
+                        NSString *p = parts[i];
+                        if ([p isEqualToString:@"Cmd"]) mask |= NSEventModifierFlagCommand;
+                        else if ([p isEqualToString:@"Ctrl"]) mask |= NSEventModifierFlagControl;
+                        else if ([p isEqualToString:@"Alt"]) mask |= NSEventModifierFlagOption;
+                        else if ([p isEqualToString:@"Shift"]) mask |= NSEventModifierFlagShift;
+                    }
+                }
+                NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:label
+                                                               action:@selector(click:)
+                                                        keyEquivalent:key];
+                item.target = target;
+                item.representedObject = onClick;
+                item.keyEquivalentModifierMask = mask;
+                [current addItem:item];
+            } else if (line.length > 0) {
+                NSMenuItem *top = [[NSMenuItem alloc] initWithTitle:line action:NULL keyEquivalent:@""];
+                NSMenu *m = [[NSMenu alloc] initWithTitle:line];
+                top.submenu = m;
+                [root addItem:top];
+                current = m;
+            }
+        }
+        [NSApp setMainMenu:root];
+    };
+
+    if ([NSThread isMainThread]) build();
+    else dispatch_sync(dispatch_get_main_queue(), build);
+}
+
+/* ---- Accessibility tree (P-Native P1) ---- */
+void ui3_plat_accessibility(ui3_host *host, ui3_a11y_node *root)
+{
+    (void)host;
+    (void)root;
+    /* Ui3View already reads host->plat_a11y via accessibilityChildren.
+     * VoiceOver picks up changes automatically when a11y children change. */
+}
+
+/* ---- Clipboard multi-format (P-Native P2) ---- */
+
+static const char * const ui3_png_type = "public.png";
+static const char * const ui3_files_type = "NSFilenamesPboardType";
+static const char * const ui3_html_type = "com.apple.html";
+
+void ui3_plat_clipboard_set_image(ui3_host *host, const void *data, int len)
+{
+    if (host && host->headless) {
+        free(host->last_clip_image);
+        if (data && len > 0) {
+            host->last_clip_image = malloc(len);
+            if (host->last_clip_image) {
+                memcpy(host->last_clip_image, data, len);
+                host->last_clip_image_len = len;
+            }
+        } else {
+            host->last_clip_image = NULL;
+            host->last_clip_image_len = 0;
+        }
+        return;
+    }
+    @autoreleasepool {
+        if (!data || len <= 0) return;
+        NSPasteboard *pb = [NSPasteboard generalPasteboard];
+        [pb setData:[NSData dataWithBytes:data length:len] forType:[NSString stringWithUTF8String:ui3_png_type]];
+    }
+}
+
+const void *ui3_plat_clipboard_get_image(ui3_host *host, int *out_len)
+{
+    (void)host;
+    if (out_len) *out_len = 0;
+    NSPasteboard *pb = [NSPasteboard generalPasteboard];
+    NSData *d = [pb dataForType:[NSString stringWithUTF8String:ui3_png_type]];
+    if (!d || [d length] == 0) return NULL;
+    if (out_len) *out_len = (int)[d length];
+    return [d bytes];
+}
+
+void ui3_plat_clipboard_set_uris(ui3_host *host, const char *uris)
+{
+    if (host && host->headless) {
+        free(host->last_clip_uris);
+        host->last_clip_uris = uris ? strdup(uris) : NULL;
+        return;
+    }
+    @autoreleasepool {
+        NSMutableArray *arr = [NSMutableArray array];
+        char *dup = uris ? strdup(uris) : NULL;
+        if (!dup) return;
+        for (char *line = strtok(dup, "\n"); line; line = strtok(NULL, "\n")) {
+            NSString *url = [NSString stringWithUTF8String:line];
+            if ([url length]) [arr addObject:[NSURL URLWithString:url]];
+        }
+        free(dup);
+        NSPasteboard *pb = [NSPasteboard generalPasteboard];
+        [pb setData:[NSKeyedArchiver archivedDataWithRootObject:arr] forType:[NSString stringWithUTF8String:ui3_files_type]];
+    }
+}
+
+static char *ui3_memo_uris = NULL;
+
+const char *ui3_plat_clipboard_get_uris(ui3_host *host)
+{
+    (void)host;
+    free(ui3_memo_uris); ui3_memo_uris = NULL;
+    NSPasteboard *pb = [NSPasteboard generalPasteboard];
+    NSData *d = [pb dataForType:[NSString stringWithUTF8String:ui3_files_type]];
+    if (!d) return "";
+    NSArray *arr = [NSKeyedUnarchiver unarchivedObjectOfClass:[NSArray class] fromData:d error:nil];
+    if (!arr || ![arr count]) return "";
+    NSMutableString *m = [NSMutableString string];
+    for (NSURL *u in arr) {
+        if ([m length]) [m appendString:@"\n"];
+        NSString *p = [u path];
+        if (p) [m appendString:p];
+    }
+    ui3_memo_uris = strdup([m UTF8String]);
+    return ui3_memo_uris;
+}
+
+static char *ui3_memo_html = NULL;
+
+void ui3_plat_clipboard_set_html(ui3_host *host, const char *html, const char *base_url)
+{
+    if (host && host->headless) {
+        free(host->last_clip_html);
+        host->last_clip_html = html ? strdup(html) : NULL;
+        return;
+    }
+    @autoreleasepool {
+        if (!html || !html[0]) return;
+        NSPasteboard *pb = [NSPasteboard generalPasteboard];
+        NSData *d = [NSData dataWithBytes:html length:(int)strlen(html)];
+        [pb setData:d forType:[NSString stringWithUTF8String:ui3_html_type]];
+    }
+}
+
+const char *ui3_plat_clipboard_get_html(ui3_host *host)
+{
+    (void)host;
+    free(ui3_memo_html); ui3_memo_html = NULL;
+    NSPasteboard *pb = [NSPasteboard generalPasteboard];
+    NSData *d = [pb dataForType:[NSString stringWithUTF8String:ui3_html_type]];
+    if (!d || [d length] == 0) return "";
+    ui3_memo_html = malloc([d length] + 1);
+    if (ui3_memo_html) {
+        memcpy(ui3_memo_html, [d bytes], [d length]);
+        ui3_memo_html[[d length]] = '\0';
+    }
+    return ui3_memo_html;
+}
+
+int ui3_plat_clipboard_formats(ui3_host *host)
+{
+    (void)host;
+    int m = 0;
+    NSPasteboard *pb = [NSPasteboard generalPasteboard];
+    NSArray *types = [pb types];
+    for (NSString *t in types) {
+        const char *ts = [t UTF8String];
+        if ([t isEqualToString:NSPasteboardTypeString] || strcmp(ts, "public.utf8-plain-text") == 0)
+            m |= UI3_CLIP_TEXT;
+        if (strcmp(ts, ui3_png_type) == 0)
+            m |= UI3_CLIP_IMAGE;
+        if (strcmp(ts, ui3_files_type) == 0)
+            m |= UI3_CLIP_FILES;
+        if (strcmp(ts, ui3_html_type) == 0)
+            m |= UI3_CLIP_HTML;
+    }
+    return m;
+}
+
 /* ---- System clipboard (P0.2) ---- */
 void ui3_host_set_clipboard_text(ui3_host *host, const char *text)
 {
-    (void)host;
     if (!text) return;
+    if (host && host->headless) {
+        free(host->last_clip_text);
+        host->last_clip_text = strdup(text);
+    }
     @autoreleasepool {
         NSPasteboard *pb = [NSPasteboard generalPasteboard];
         [pb clearContents];

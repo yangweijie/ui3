@@ -7,6 +7,7 @@ use Kingbes\Phpc\Phpc;
 use Yangweijie\Ui3\Animation;
 use Yangweijie\Ui3\Backend;
 use Yangweijie\Ui3\Canvas\Layout;
+use Yangweijie\Ui3\Compositor;
 use Yangweijie\Ui3\Canvas\Node;
 use Yangweijie\Ui3\Element;
 use Yangweijie\Ui3\FFI\{Cairo, LibUi3};
@@ -68,8 +69,17 @@ final class Canvas implements Backend
     /** Scroll container id activated by pointer-down, for arrow-key scrolling. */
     private ?string $activeScrollId = null;
 
+    /** Compositor for backing-surface rendering with dirty-rect tracking. */
+    private Compositor $compositor;
+
     /** In-memory clipboard mirror; synced to the native host clipboard when a real window exists. */
     private string $clipboard = '';
+    /** Headless multi-format clipboard storage (used when nativeClipboard is false). */
+    private string $lastClipImage = '';
+    private string $lastClipUris = '';
+    private string $lastClipHtml = '';
+    /** Extra hosts keyed by window id (multi-window support). Each value is ['host'=>resource, 'keep'=>array]. */
+    private array $extraHosts = [];
 
     private const POINTER_DOWN = 1;
     private const POINTER_UP = 2;
@@ -91,8 +101,15 @@ final class Canvas implements Backend
     private const KEY_SHIFT_RIGHT = "\x12";
     private const KEY_SHIFT_UP = "\x13";
     private const KEY_SHIFT_DOWN = "\x14";
+    private const MOD_SHIFT = 1;
+    private const MOD_CTRL  = 2;
+    private const MOD_ALT   = 4;
+    private const MOD_CMD   = 8;
     /** Mouse-wheel event (host ABI UI3_EVENT_WHEEL). data = pixels scrolled. */
     private const WHEEL = 5;
+    private const DROP = 6;
+    private const MENU = 7;
+    private const GESTURE = 8;
     /** Widget types that join the Tab order and show a focus ring. */
     private const FOCUSABLE = ['input', 'textarea', 'button', 'iconbutton', 'checkbox', 'radio', 'select', 'list', 'toggle', 'segmented', 'search'];
     /** Widget types browsable with arrow keys + Enter. */
@@ -105,6 +122,7 @@ final class Canvas implements Backend
     {
         $this->ffi = LibUi3::ffi();
         $this->theme = Theme::get(Theme::LIGHT);
+        $this->compositor = new Compositor();
     }
 
     /**
@@ -175,12 +193,29 @@ final class Canvas implements Backend
         return false;
     }
 
-    /** Ask the native host to repaint (real windows only). */
+    /** Ask the native host to repaint (real windows only). Marks the entire
+     *  compositor surface dirty so the next frame does a full blit. */
     public function requestRedraw(): void
     {
+        $this->compositor->markFullDirty();
         if ($this->host) {
             Phpc::call($this->ffi, 'ui3_host_request_redraw', [$this->host]);
         }
+    }
+
+    /** Mark a rectangular region of the compositor backing surface as dirty.
+     *  Call this BEFORE requestRedraw() when only a small area changed, so
+     *  the compositor can blit just that region instead of the full surface.
+     *  Coordinates are in window-space pixels. */
+    public function markDirty(int $x, int $y, int $w, int $h): void
+    {
+        $this->compositor->markDirty($x, $y, $w, $h);
+    }
+
+    /** Expose the compositor for tests / offscreenPixels readback. */
+    public function compositor(): Compositor
+    {
+        return $this->compositor;
     }
 
     /** Wall-clock now, matching the value paint() assigns to $this->clock. */
@@ -302,6 +337,265 @@ final class Canvas implements Backend
     public function closeContextMenus(): void
     {
         $this->contextMenus = [];
+    }
+
+    /* ---- Window management (P1) ---- */
+
+    /** Set the native window title. */
+    public function setTitle(string $title): void
+    {
+        Phpc::call($this->ffi, 'ui3_host_set_title', [$this->host, $title]);
+    }
+
+    /** Resize the native window; updates the host width/height. */
+    public function resize(int $w, int $h): void
+    {
+        Phpc::call($this->ffi, 'ui3_host_resize', [$this->host, $w, $h]);
+    }
+
+    /** Minimize (iconify) the native window. */
+    public function minimize(): void
+    {
+        Phpc::call($this->ffi, 'ui3_host_minimize', [$this->host]);
+    }
+
+    /** Close the native window (sets the closed flag, stops the event loop). */
+    public function close(): void
+    {
+        Phpc::call($this->ffi, 'ui3_host_close', [$this->host]);
+    }
+
+    /** Current native window title. */
+    public function title(): string
+    {
+        return Phpc::call($this->ffi, 'ui3_host_title', [$this->host]);
+    }
+
+    /** Whether the native window has been closed. */
+    public function isClosed(): bool
+    {
+        return (bool) Phpc::call($this->ffi, 'ui3_host_closed', [$this->host]);
+    }
+
+    /** Current host content width. */
+    public function width(): int
+    {
+        return (int) Phpc::call($this->ffi, 'ui3_host_width', [$this->host]);
+    }
+
+    /** Current host content height. */
+    public function height(): int
+    {
+        return (int) Phpc::call($this->ffi, 'ui3_host_height', [$this->host]);
+    }
+
+    /** Move the native window to (x, y). */
+    public function move(int $x, int $y): void
+    {
+        Phpc::call($this->ffi, 'ui3_host_move', [$this->host, $x, $y]);
+    }
+
+    /** Toggle native fullscreen mode. */
+    public function fullscreen(): void
+    {
+        Phpc::call($this->ffi, 'ui3_host_fullscreen', [$this->host]);
+    }
+
+    /**
+     * Set a callback that is invoked before the native window is closed (via
+     * the OS close button / Cmd+W). Set $cb to null to remove. The callback
+     * receives a reference: fn(&$accept) => void — set $accept = false to
+     * block the close.
+     */
+    public function setCloseHandler(?callable $cb): void
+    {
+        if ($cb === null) {
+            Phpc::call($this->ffi, 'ui3_host_set_close_cb', [$this->host, null, null]);
+            return;
+        }
+        $wrapper = Phpc::callback($this->ffi, function ($ctx, $acceptPtr) use ($cb) {
+            try {
+                $accept = true;
+                ($cb)($accept);
+                if (!$accept && $acceptPtr !== null) {
+                    // Write 0 to the int* to block the close
+                    \FFI::memcpy($acceptPtr, pack('V', 0), 4);
+                }
+            } catch (\Throwable) {
+                // On error, allow the close
+            }
+        }, 'void(*)(void*,int*)');
+        $this->keep[] = $wrapper;
+        Phpc::call($this->ffi, 'ui3_host_set_close_cb', [$this->host, $wrapper->raw(), null]);
+    }
+
+    /** Current window x position. */
+    public function x(): int
+    {
+        return (int) Phpc::call($this->ffi, 'ui3_host_x', [$this->host]);
+    }
+
+    /** Current window y position. */
+    public function y(): int
+    {
+        return (int) Phpc::call($this->ffi, 'ui3_host_y', [$this->host]);
+    }
+
+    /** Whether the window is in native fullscreen mode. */
+    public function isFullscreen(): bool
+    {
+        return (bool) Phpc::call($this->ffi, 'ui3_host_fullscreen_state', [$this->host]);
+    }
+
+    /* ---- Native modal dialogs (P-Native P1) ---- */
+
+    /**
+     * Show a native modal dialog and return the 0-based index of the clicked
+     * button. Unlike openFile/saveFile, this works headless too: the C host
+     * records the call and returns a preset result (see setDialogResult).
+     *
+     * @param int    $kind    0=info 1=warning 2=error 3=question
+     * @param int    $style   0=window-modal 1=sheet (native sheet where supported)
+     * @param string $buttons "|"-separated button labels, e.g. "OK" / "OK|Cancel"
+     */
+    public function dialog(int $kind, int $style, ?string $title, ?string $message, string $buttons): int
+    {
+        return (int) Phpc::call($this->ffi, 'ui3_host_dialog', [
+            $this->host, $kind, $style, $title ?? '', $message ?? '', $buttons,
+        ]);
+    }
+
+    /** Show a native alert (single OK button). Returns nothing. */
+    public function alert(string $message, ?string $title = null): void
+    {
+        $this->dialog(0, 0, $title, $message, 'OK');
+    }
+
+    /** Show a native confirm dialog. Returns true when the first button is clicked. */
+    public function confirm(string $message, ?string $title = null): bool
+    {
+        return $this->dialog(3, 0, $title, $message, 'OK|Cancel') === 0;
+    }
+
+    /** Show a native sheet (attached to the window where supported). */
+    public function sheet(string $message, ?string $title = null): void
+    {
+        $this->dialog(0, 1, $title, $message, 'OK');
+    }
+
+    /** Show a native About dialog (title + message, info style). */
+    public function about(string $title, string $message): void
+    {
+        $this->dialog(0, 0, $title, $message, 'OK');
+    }
+
+    /**
+     * Preset the value returned by dialog()/confirm() in headless mode (automation).
+     * Default 0 (first button).
+     */
+    public function setDialogResult(int $result): void
+    {
+        Phpc::call($this->ffi, 'ui3_host_set_dialog_result', [$this->host, $result]);
+    }
+
+    /**
+     * Last dialog invocation recorded by the C host, as
+     * ['kind' => int, 'style' => int, 'title' => string, 'message' => string,
+     *  'buttons' => string], or null if none. Used by automation to assert the
+     * call headless.
+     *
+     * @return array{kind:int,style:int,title:string,message:string,buttons:string}|null
+     */
+    public function lastDialog(): ?array
+    {
+        $s = $this->cstr(Phpc::call($this->ffi, 'ui3_host_last_dialog', [$this->host]));
+        if ($s === '') {
+            return null;
+        }
+        [$kind, $style, $title, $message, $buttons] = explode("\t", $s, 5);
+        return [
+            'kind' => (int) $kind,
+            'style' => (int) $style,
+            'title' => $title,
+            'message' => $message,
+            'buttons' => $buttons,
+        ];
+    }
+
+    /* ---- Native notification / toast (P-Native P1) ---- */
+
+    /** Show a native OS notification/toast. Works headless too (the host
+     * records the call; see lastNotify). Returns true on success. */
+    public function notify(string $title, string $body = ''): bool
+    {
+        return (int) Phpc::call($this->ffi, 'ui3_host_notify', [$this->host, $title, $body]) === 0;
+    }
+
+    /**
+     * Last notification recorded by the C host, as ['title' => string,
+     * 'body' => string], or null if none. Used by automation to assert the
+     * call headless.
+     *
+     * @return array{title:string,body:string}|null
+     */
+    public function lastNotify(): ?array
+    {
+        $s = $this->cstr(Phpc::call($this->ffi, 'ui3_host_last_notify', [$this->host]));
+        if ($s === '') {
+            return null;
+        }
+        [$title, $body] = explode("\t", $s, 2);
+        return ['title' => $title, 'body' => $body];
+    }
+
+    /* ---- Native menu bar (P-Native P1) ---- */
+
+    /**
+     * Encode a menu structure (from Ui::menu / Ui::menuItem / Ui::menuSeparator)
+     * into the C text format:
+     *   "File\n\tOpen\topen\tCmd+O\n\t-\nEdit\n\tCut\tcut\tCmd+X\n"
+     */
+    private function serializeMenu(array $menus): string
+    {
+        $out = '';
+        foreach ($menus as $m) {
+            $out .= (string) ($m['label'] ?? '') . "\n";
+            foreach ($m['items'] ?? [] as $it) {
+                if (!empty($it['separator'])) {
+                    $out .= "\t-\n";
+                    continue;
+                }
+                $out .= "\t" . (string) ($it['label'] ?? '')
+                     . "\t" . (string) ($it['onClick'] ?? '')
+                     . "\t" . (string) ($it['shortcut'] ?? '') . "\n";
+            }
+        }
+        return $out;
+    }
+
+    /** Install the native menu bar from an encoded menu string. */
+    public function setMenu(string $menu): void
+    {
+        Phpc::call($this->ffi, 'ui3_host_set_menu', [$this->host, $menu]);
+    }
+
+    /** Last set_menu text recorded by the host, or null if none (automation). */
+    public function lastMenu(): ?string
+    {
+        $s = $this->cstr(Phpc::call($this->ffi, 'ui3_host_last_menu', [$this->host]));
+        return $s === '' ? null : $s;
+    }
+
+    public function lastA11y(): string
+    {
+        $s = $this->cstr(Phpc::call($this->ffi, 'ui3_host_last_a11y', [$this->host]));
+        return $s === '' ? '' : $s;
+    }
+
+    /** Simulate clicking a menu item by its onClick message (automation). */
+    public function clickMenu(string $message): void
+    {
+        Phpc::call($this->ffi, 'ui3_host_click_menu', [$this->host, $message]);
     }
 
     public function isContextMenuOpen(string $id): bool
@@ -800,6 +1094,11 @@ final class Canvas implements Backend
         $this->keep = [$draw, $ev];
         Phpc::call($this->ffi, 'ui3_host_set_draw_cb', [$this->host, $draw->raw(), null]);
         Phpc::call($this->ffi, 'ui3_host_set_event_cb', [$this->host, $ev->raw(), null]);
+
+        $menu = $root->prop('menu');
+        if (is_array($menu)) {
+            $this->setMenu($this->serializeMenu($menu));
+        }
     }
 
     public function update(Element $root): void
@@ -811,11 +1110,89 @@ final class Canvas implements Backend
         if ($this->host) {
             Phpc::call($this->ffi, 'ui3_host_request_redraw', [$this->host]);
         }
+        $this->buildA11yTree();
+    }
+
+    private function buildA11yTree(): void
+    {
+        $root = $this->root;
+        if (!$root || !$this->host) return;
+        $layout = $this->layout;
+        $lines = $this->flattenA11yTree($root, $layout, 0);
+        if (empty($lines)) return;
+        $text = implode("\n", $lines);
+        Phpc::call($this->ffi, 'ui3_host_set_a11y_text', [$this->host, $text]);
+    }
+
+    /**
+     * Walk the Element tree and produce tab-separated lines:
+     *   role\tlabel\tdesc\tx\ty\tw\th\tfocus\texpanded\tselected\tdisabled\tchecked
+     *
+     * Indentation (tabs) indicates nesting depth so C can rebuild the tree.
+     */
+    private function flattenA11yTree(Element $el, array $layout, int $depth): array
+    {
+        $role = $this->roleForType($el->type);
+        $label = (string)($el->prop('label') ?? '');
+        $desc  = (string)($el->prop('description') ?? '');
+        $bounds = $this->boundsForElement($el, $layout);
+        $prefix = str_repeat("\t", $depth);
+        $line = $prefix . implode("\t", [
+            $role,
+            $label,
+            $desc,
+            $bounds[0], $bounds[1], $bounds[2], $bounds[3],
+            0, 0, 0, 0, 0,
+        ]);
+        $out = [$line];
+        foreach ($el->children as $child) {
+            $out = array_merge($out, $this->flattenA11yTree($child, $layout, $depth + 1));
+        }
+        return $out;
+    }
+
+    private function boundsForElement(Element $el, array $layout): array
+    {
+        if ($layout && is_array($layout)) {
+            foreach ($layout as $node) {
+                if ($node && $node->el === $el) {
+                    return [(int)($node->x ?? 0), (int)($node->y ?? 0),
+                            (int)($node->w ?? 0), (int)($node->h ?? 0)];
+                }
+            }
+        }
+        return [0, 0, 0, 0];
+    }
+
+    private function roleForType(string $type): string
+    {
+        return match ($type) {
+            'button'   => 'button',
+            'checkbox' => 'checkbox',
+            'radio'    => 'radio',
+            'textbox'  => 'textbox',
+            'textarea' => 'textbox',
+            'label'    => 'label',
+            'image'    => 'image',
+            'divider'  => 'separator',
+            'scroll'   => 'scrollbar',
+            'table'    => 'table',
+            'row'      => 'row',
+            'tree'     => 'tree',
+            'combo'    => 'combobox',
+            'popup'    => 'popup',
+            'dialog'   => 'dialog',
+            default    => 'group',
+        };
     }
 
     public function step(): int
     {
-        return (int) Phpc::call($this->ffi, 'ui3_host_step', [$this->host]);
+        $ret = (int) Phpc::call($this->ffi, 'ui3_host_step', [$this->host]);
+        foreach ($this->extraHosts as $entry) {
+            Phpc::call($this->ffi, 'ui3_host_step', [$entry['host']]);
+        }
+        return $ret;
     }
 
     public function run(): void
@@ -834,6 +1211,62 @@ final class Canvas implements Backend
         if ($this->host) {
             Phpc::call($this->ffi, 'ui3_host_quit', [$this->host]);
         }
+        foreach ($this->extraHosts as $entry) {
+            Phpc::call($this->ffi, 'ui3_host_quit', [$entry['host']]);
+        }
+    }
+
+    /**
+     * Create an additional native OS window (multi-window support).
+     * The extra host shares the same Element tree and event routing as the main host.
+     */
+    public function createExtraHost(string $id, string $title, int $w, int $h): void
+    {
+        if (isset($this->extraHosts[$id])) {
+            return;
+        }
+        $host = Phpc::call($this->ffi, 'ui3_host_create', [$title, $w, $h, $this->headless ? 1 : 0]);
+        if (!$host) {
+            return;
+        }
+
+        $draw = Phpc::callback($this->ffi, function ($ctx, $host, $cr) {
+            try {
+                $this->paint($cr);
+            } catch (\Throwable $e) {
+                fwrite(STDERR, "CANVAS EXTRA DRAW ERR: {$e}\n");
+            }
+        }, 'void(*)(void*,void*,void*)');
+        $ev = Phpc::callback($this->ffi, function ($ctx, int $kind, float $x, float $y, float $data, $text) {
+            try {
+                $text = $text !== null ? \FFI::string($text) : null;
+                $this->onEvent($kind, $x, $y, $data, $text);
+            } catch (\Throwable $e) {
+                fwrite(STDERR, "CANVAS EXTRA EVENT ERR: {$e}\n");
+            }
+        }, 'void(*)(void*,int,double,double,double,char*)');
+
+        Phpc::call($this->ffi, 'ui3_host_set_draw_cb', [$host, $draw->raw(), null]);
+        Phpc::call($this->ffi, 'ui3_host_set_event_cb', [$host, $ev->raw(), null]);
+
+        $this->extraHosts[$id] = ['host' => $host, 'keep' => [$draw, $ev]];
+    }
+
+    /** Destroy an extra host and close its native window. */
+    public function destroyExtraHost(string $id): void
+    {
+        if (!isset($this->extraHosts[$id])) {
+            return;
+        }
+        $entry = $this->extraHosts[$id];
+        Phpc::call($this->ffi, 'ui3_host_destroy', [$entry['host']]);
+        unset($this->extraHosts[$id]);
+    }
+
+    /** Number of extra hosts currently active. */
+    public function extraHostCount(): int
+    {
+        return count($this->extraHosts);
     }
 
     /** Inject a pointer event (headless automation). */
@@ -849,13 +1282,23 @@ final class Canvas implements Backend
     }
 
     /**
+     * Inject a drop event (headless automation / DnD). $type 0=text 1=files;
+     * $payload is UTF-8 (newline-separated paths for files). Mirrors a native
+     * drag-drop onto the window at ($x,$y).
+     */
+    public function injectDrop(int $type, float $x, float $y, string $payload): void
+    {
+        Phpc::call($this->ffi, 'ui3_host_inject_drop', [$this->host, $type, $x, $y, $payload]);
+    }
+
+    /**
      * Feed a key by raw scancode + modifiers — the exact same translation a
      * real Cocoa keyDown uses (#5c). Lets headless automation exercise the
      * native key path (Tab/Shift+Tab/arrows/Enter/Backspace) without a display.
      */
-    public function injectRawKey(int $keycode, bool $shift = false, string $chars = ''): void
+    public function injectRawKey(int $keycode, int $modifiers = 0, string $chars = ''): void
     {
-        Phpc::call($this->ffi, 'ui3_host_inject_raw_key', [$this->host, $keycode, $shift ? 1 : 0, $chars]);
+        Phpc::call($this->ffi, 'ui3_host_inject_raw_key', [$this->host, $keycode, $modifiers, $chars]);
     }
 
     /**
@@ -863,9 +1306,9 @@ final class Canvas implements Backend
      * -> a synthesized native key event through the platform key path (e.g. Cocoa
      * window.keyDown:). This lets automation drive AND verify the real key path.
      */
-    public function postKey(int $keycode, bool $shift, string $chars): void
+    public function postKey(int $keycode, int $modifiers = 0, string $chars = ''): void
     {
-        Phpc::call($this->ffi, 'ui3_host_post_key', [$this->host, $keycode, $shift ? 1 : 0, $chars]);
+        Phpc::call($this->ffi, 'ui3_host_post_key', [$this->host, $keycode, $modifiers, $chars]);
     }
 
     /** Focus a widget by id (real-window focus behavior). */
@@ -987,6 +1430,115 @@ final class Canvas implements Backend
             } catch (\Throwable) {
                 // in-memory mirror already updated
             }
+        }
+    }
+
+    /** Multi-format clipboard: set PNG image data. */
+    public function setClipboardImage(string $png): void
+    {
+        if ($this->nativeClipboard()) {
+            $p = \FFI::new('char[' . strlen($png) . ']');
+            \FFI::memcpy($p, $png, strlen($png));
+            try {
+                Phpc::call($this->ffi, 'ui3_host_set_clipboard_image', [$this->host, $p, strlen($png)]);
+            } catch (\Throwable) {
+                // fall back to headless storage
+                $this->lastClipImage = $png;
+            }
+        } else {
+            $this->lastClipImage = $png;
+        }
+    }
+
+    /** Multi-format clipboard: get PNG image data, or null if empty. */
+    public function getClipboardImage(): ?string
+    {
+        if ($this->nativeClipboard()) {
+            try {
+                $lPtr = \FFI::new('int');
+                $p = Phpc::call($this->ffi, 'ui3_host_get_clipboard_image', [$this->host, \FFI::addr($lPtr)]);
+                if ($p === null) return null;
+                $len = \FFI::read($lPtr, 'int');
+                if ($len <= 0) { \FFI::free($p); return null; }
+                $out = \FFI::string($p, $len);
+                \FFI::free($p);
+                return $out;
+            } catch (\Throwable) {
+                return $this->lastClipImage;
+            }
+        }
+        return $this->lastClipImage;
+    }
+
+    /** Multi-format clipboard: set newline-separated file URLs. */
+    public function setClipboardUris(string $uris): void
+    {
+        if ($this->nativeClipboard()) {
+            try {
+                Phpc::call($this->ffi, 'ui3_host_set_clipboard_uris', [$this->host, $uris]);
+            } catch (\Throwable) {
+                $this->lastClipUris = $uris;
+            }
+        } else {
+            $this->lastClipUris = $uris;
+        }
+    }
+
+    /** Multi-format clipboard: get newline-separated file URLs. */
+    public function getClipboardUris(): string
+    {
+        if ($this->nativeClipboard()) {
+            try {
+                return $this->cstr(Phpc::call($this->ffi, 'ui3_host_get_clipboard_uris', [$this->host]));
+            } catch (\Throwable) {
+                return $this->lastClipUris;
+            }
+        }
+        return $this->lastClipUris;
+    }
+
+    /** Multi-format clipboard: set HTML content. */
+    public function setClipboardHtml(string $html): void
+    {
+        if ($this->nativeClipboard()) {
+            try {
+                Phpc::call($this->ffi, 'ui3_host_set_clipboard_html', [$this->host, $html, '']);
+            } catch (\Throwable) {
+                $this->lastClipHtml = $html;
+            }
+        } else {
+            $this->lastClipHtml = $html;
+        }
+    }
+
+    /** Multi-format clipboard: get HTML content. */
+    public function getClipboardHtml(): string
+    {
+        if ($this->nativeClipboard()) {
+            try {
+                return $this->cstr(Phpc::call($this->ffi, 'ui3_host_get_clipboard_html', [$this->host]));
+            } catch (\Throwable) {
+                return $this->lastClipHtml;
+            }
+        }
+        return $this->lastClipHtml;
+     }
+
+    /** Return available clipboard format bitmask (UI3_CLIP_*). */
+    public function clipboardFormats(): int
+    {
+        if (!$this->nativeClipboard()) {
+            $m = 0;
+            if ($this->clipboard !== '') $m |= 1;
+            if ($this->lastClipImage !== '') $m |= 2;
+            if ($this->lastClipUris !== '') $m |= 4;
+            if ($this->lastClipHtml !== '') $m |= 8;
+            return $m;
+        }
+        try {
+            return (int)Phpc::call($this->ffi, 'ui3_host_clipboard_formats', [$this->host]);
+        } catch (\Throwable) {
+            return 0;
         }
     }
 
@@ -1184,6 +1736,37 @@ final class Canvas implements Backend
         return $this->layout;
     }
 
+    /**
+     * Render an Element's text with rich-text styling props: bold, italic,
+     * underline, fontSize, fontFamily, color.  Falls back to defaultSize and
+     * the theme's 'text' colour when the element doesn't specify them.
+     */
+    private function renderElementText($cr, $el, float $x, float $y, float $defaultSize = 13): void
+    {
+        $text = (string) $el->prop('text', '');
+        if ($text === '') return;
+        $size = (float) ($el->prop('fontSize', $defaultSize));
+        $weight = $el->prop('bold', false) ? 1 : 0;
+        $slant = $el->prop('italic', false) ? 1 : 0;
+        $family = $el->prop('fontFamily', null);
+        $color = $el->prop('color', null);
+        if ($color !== null) {
+            $r = hexdec(substr($color, 1, 2)) / 255;
+            $g = hexdec(substr($color, 3, 2)) / 255;
+            $b = hexdec(substr($color, 5, 2)) / 255;
+        } else {
+            list($r, $g, $b) = $this->col('text');
+        }
+        Cairo::text($cr, $x, $y + $size, $text, $size, $r, $g, $b, $family, $weight, $slant);
+
+        if ($el->prop('underline', false)) {
+            $e = Cairo::textExtents($cr, $text);
+            $lx = $x - ($e['w'] > 0 ? $e['w'] : 0) * 0.02;   /* ~greek shift */
+            $ly = $y + $size + 1.5;
+            Cairo::line($cr, $lx, $ly, $lx + ($e['w'] ?: mb_strlen($text) * $size * 0.55), $ly, $r, $g, $b, 1.0);
+        }
+    }
+
     private function paint($cr): void
     {
         // The host hands back its cairo_t* as a void* (cross-FFI scope); bridge
@@ -1194,13 +1777,45 @@ final class Canvas implements Backend
         $this->framesDrawn++;
         $w = $this->root ? (int) $this->root->prop('width', 320) : 320;
         $h = $this->root ? (int) $this->root->prop('height', 240) : 240;
-        Cairo::fillRect($cr, 0, 0, $w, $h, ...$this->col('bg'));
-        if (!$this->root) {
-            return;
+
+        // ---- 1. Render main content to the compositor's backing surface ----
+        $this->compositor->ensureSize($w, $h);
+        $bg = $this->col('bg');
+        $backingCr = $this->compositor->beginFrame($bg[0], $bg[1], $bg[2]);
+
+        if ($backingCr !== null && $this->root) {
+            $this->renderNodesToBacking($backingCr);
         }
-        // Rubber-band: decay elastic overshoot toward 0 each frame so a past-edge
-        // scroll springs back. Then merge the damped overshoot into the offsets
-        // used for layout, so the content visually overshoots and settles.
+
+        // ---- 2. Blit dirty rects from backing surface to host ----
+        $this->compositor->endFrame($cr);
+
+        // ---- 3. Overlays drawn directly on the host cr ----
+        if ($this->root) {
+            $this->drawOverlays($cr);
+        }
+
+        // ---- 4. Keep the frame loop alive for animations / scroll physics ----
+        $scrollAnimating = $this->scrollElastic !== []
+            || $this->clock < $this->scrollbarVisibleUntil + self::SCROLLBAR_FADE;
+        if ($this->host && ($this->isAnimating() || $scrollAnimating)) {
+            Phpc::call($this->ffi, 'ui3_host_request_redraw', [$this->host]);
+        }
+    }
+
+    /**
+     * Draw all layout nodes to the given cairo context.
+     * Includes rubber-band decay, scroll offset computation, and the clip stack.
+     */
+    /**
+     * Draw all layout nodes to the backing surface. Maintains the clip stack
+     * via sequential iteration — each `scroll` node pushes its viewport rect
+     * (drawn unclipped), then content inside is painted clipped; `scroll_end`
+     * pops it (scrollbar for that container is drawn by drawOverlays instead).
+     */
+    private function renderNodesToBacking($cr): void
+    {
+        // Rubber-band decay
         foreach ($this->scrollElastic as $eid => $e) {
             $e2 = $e * 0.82;
             if (abs($e2) < 0.5) {
@@ -1215,9 +1830,39 @@ final class Canvas implements Backend
             $offsets[$eid] = (int) round($off + $e * self::SCROLL_ELASTIC_DAMP);
         }
         $this->layout = Layout::compute($this->root, $offsets);
-        // Clip stack: each `scroll` node pushes its viewport rect (drawn unclipped
-        // as the frame), its content is painted clipped, and the `scroll_end`
-        // sentinel pops it. LIFO handles nested scrolls.
+
+        // Clip stack driven by sequential iteration (same as the original
+        // paint() loop, but without inline scrollbar drawing).
+        $clipStack = [];
+        foreach ($this->layout as $n) {
+            if ($n->type === 'scroll_end') {
+                // Sentinal — scrollbar for this container goes to drawOverlays.
+                array_pop($clipStack);
+                continue;
+            }
+            $clip = $clipStack !== [] ? $clipStack[count($clipStack) - 1] : null;
+            if ($clip !== null) {
+                Cairo::save($cr);
+                Cairo::clip($cr, $clip[0], $clip[1], $clip[2], $clip[3]);
+            }
+            $this->drawNode($cr, $n);
+            if ($clip !== null) {
+                Cairo::restore($cr);
+            }
+            if ($n->type === 'scroll') {
+                $clipStack[] = [$n->x, $n->y, $n->w, $n->h];
+            }
+        }
+    }
+
+    /**
+     * Draw overlays (scrollbars + context menus) directly on the host cr.
+     * These sit outside the compositor's backing surface so they always
+     * redraw at full resolution and are not affected by dirty-rect clipping.
+     */
+    private function drawOverlays($cr): void
+    {
+        // Rebuild clip stack to know scroll containers for their scrollbars.
         $clipStack = [];
         foreach ($this->layout as $n) {
             if ($n->type === 'scroll_end') {
@@ -1226,15 +1871,6 @@ final class Canvas implements Backend
                     $this->drawScrollbar($cr, $sc);
                 }
                 continue;
-            }
-            $clip = $clipStack !== [] ? $clipStack[count($clipStack) - 1]['rect'] : null;
-            if ($clip !== null) {
-                Cairo::save($cr);
-                Cairo::clip($cr, $clip[0], $clip[1], $clip[2], $clip[3]);
-            }
-            $this->drawNode($cr, $n);
-            if ($clip !== null) {
-                Cairo::restore($cr);
             }
             if ($n->type === 'scroll') {
                 $id = $n->el->prop('id');
@@ -1247,8 +1883,7 @@ final class Canvas implements Backend
                 ];
             }
         }
-        // Overlay scrollbars for virtual list controls, drawn last so they sit
-        // on top of their windowed rows (lists have no clip sentinel).
+        // Overlay scrollbars for virtual list controls.
         foreach ($this->layout as $n) {
             if ($n->type !== 'list' || !(bool) $n->el->prop('virtual', false)) {
                 continue;
@@ -1264,13 +1899,6 @@ final class Canvas implements Backend
         foreach ($this->contextMenus as $menu) {
             $this->drawContextMenu($cr, $menu);
         }
-        // Keep the native frame loop alive while animations or scroll physics
-        // (rubber-band / scrollbar fade) are still in flight.
-        $scrollAnimating = $this->scrollElastic !== []
-            || $this->clock < $this->scrollbarVisibleUntil + self::SCROLLBAR_FADE;
-        if ($this->host && ($this->isAnimating() || $scrollAnimating)) {
-            Phpc::call($this->ffi, 'ui3_host_request_redraw', [$this->host]);
-        }
     }
 
     private function onEvent(int $kind, float $x, float $y, float $data, ?string $text): void
@@ -1279,7 +1907,7 @@ final class Canvas implements Backend
             $this->layout = Layout::compute($this->root);
         }
         if ($kind === self::KEY) {
-            $this->onKey($text);
+            $this->onKey($text, (int)$data);
             return;
         }
         if ($kind === self::WHEEL) {
@@ -1289,6 +1917,20 @@ final class Canvas implements Backend
             if ($id !== null) {
                 $this->scrollBy($id, (int) $data);
             }
+            return;
+        }
+        if ($kind === self::DROP) {
+            $this->onDrop($x, $y, (int) $data, $text);
+            return;
+        }
+        if ($kind === self::MENU) {
+            if ($text !== null && $text !== '' && $this->dispatch !== null) {
+                ($this->dispatch)((string) $text);
+            }
+            return;
+        }
+        if ($kind === self::GESTURE) {
+            $this->onGesture($x, $y, (int) $data);
             return;
         }
         // Drag (MOVE/UP) is driven by the in-progress drag, not by hit-testing.
@@ -1373,8 +2015,63 @@ final class Canvas implements Backend
         return $found;
     }
 
+    /** Deliver a native/automated drag-drop to the window's onDrop handler. */
+    private function onDrop(float $x, float $y, int $dtype, ?string $text): void
+    {
+        if ($this->root === null || $this->dispatch === null) {
+            return;
+        }
+        $msg = $this->root->prop('onDrop');
+        if (!is_string($msg) || $msg === '') {
+            return;
+        }
+        ($this->dispatch)($msg, [
+            'type' => $dtype === 1 ? 'files' : 'text',
+            'text' => $text ?? '',
+            'x' => $x,
+            'y' => $y,
+        ]);
+    }
+
+    /** Public entry point called by Automation::gesture(). */
+    public function injectGesture(int $gtype, float $x, float $y, string $value = ''): void
+    {
+        $this->onGesture($x, $y, $gtype);
+    }
+
+    /** Deliver a native/automated gesture to the topmost gesture target at the
+     * given point. $gtype 0=pinch 1=rotate 2=swipe; fires the element's
+     * onGesture with the canonical type name. */
+    private function onGesture(float $x, float $y, int $gtype): void
+    {
+        if ($this->dispatch === null) {
+            return;
+        }
+        $names = [0 => 'pinch', 1 => 'rotate', 2 => 'swipe', 3 => 'pan'];
+        $name = $names[$gtype] ?? null;
+        if ($name === null) {
+            return;
+        }
+        $target = null;
+        foreach ($this->layout as $n) {
+            if (($n->el->prop('gesture') ?? '') !== $name) {
+                continue;
+            }
+            if ($x >= $n->x && $x <= $n->x + $n->w && $y >= $n->y && $y <= $n->y + $n->h) {
+                $target = $n; /* innermost wins */
+            }
+        }
+        if ($target === null) {
+            return;
+        }
+        $msg = $target->el->prop('onGesture');
+        if (is_string($msg) && $msg !== '') {
+            ($this->dispatch)($msg, $name);
+        }
+    }
+
     /** Route a keystroke: Tab, list/select browsing, or text editing. */
-    private function onKey(?string $text): void
+    private function onKey(?string $text, int $modifiers = 0): void
     {
         if ($text === null || $this->dispatch === null) {
             return;
@@ -1429,34 +2126,36 @@ final class Canvas implements Backend
             return;
         }
         if (in_array($node->type, ['input', 'textarea', 'search'], true)) {
-            $this->editText($node, $text);
+            $this->editText($node, $text, $modifiers);
             return;
         }
     }
 
     /** Edit a text control: maintain the per-field buffer (see #5a). */
-    private function editText(Node $node, string $text): void
+    private function editText(Node $node, string $text, int $modifiers = 0): void
     {
         $id = (string) $node->el->prop('id', '');
         $this->seedField($id);
         $buf = &$this->fields[$id];
 
-        // ---- Ctrl+ shortcuts (host emits "Ctrl+<key>" on macOS; see P0.1) ----
-        if (str_starts_with($text, 'Ctrl+')) {
-            $lower = strtolower(substr($text, 5));
-            if ($lower === 'a') {                 // select all
+        // ---- Modifier shortcuts (Ctrl on Win/Linux, Cmd on macOS) ----
+        // Fired whenever Ctrl or Cmd is held; Alt/Cmd combos are plumbed through
+        // so e.g. Ctrl+Alt+A also selects all. See P-Native parity work.
+        if (($modifiers & (self::MOD_CTRL | self::MOD_CMD)) !== 0) {
+            $base = strtolower($this->stripModifiers($text));
+            if ($base === 'a') {                 // select all
                 $buf['sel'] = 0;
                 $buf['cursor'] = mb_strlen($buf['text']);
                 $this->requestRedraw();
                 return;
             }
-            if ($lower === 'c') {                 // copy
+            if ($base === 'c') {                 // copy
                 if ($buf['sel'] !== $buf['cursor']) {
                     $this->setClipboard(mb_substr($buf['text'], min($buf['cursor'], $buf['sel']), abs($buf['cursor'] - $buf['sel'])));
                 }
                 return;
             }
-            if ($lower === 'x') {                 // cut
+            if ($base === 'x') {                 // cut
                 if ($buf['sel'] !== $buf['cursor']) {
                     $this->setClipboard(mb_substr($buf['text'], min($buf['cursor'], $buf['sel']), abs($buf['cursor'] - $buf['sel'])));
                     $this->pushUndo($buf);
@@ -1465,7 +2164,7 @@ final class Canvas implements Backend
                 }
                 return;
             }
-            if ($lower === 'v') {                 // paste
+            if ($base === 'v') {                 // paste
                 if ($this->clipboard !== '') {
                     $this->pushUndo($buf);
                     $this->replaceSelection($buf, $this->clipboard);
@@ -1473,17 +2172,21 @@ final class Canvas implements Backend
                 }
                 return;
             }
-            if ($lower === 'z') {                 // undo
-                $this->doUndo($buf);
+            if ($base === 'z') {                 // undo (Shift = redo)
+                if ($modifiers & self::MOD_SHIFT) {
+                    $this->doRedo($buf);
+                } else {
+                    $this->doUndo($buf);
+                }
                 $this->emitInput($node, $buf);
                 return;
             }
-            if ($lower === 'y' || $lower === 'shift+z') { // redo
+            if ($base === 'y') {                 // redo
                 $this->doRedo($buf);
                 $this->emitInput($node, $buf);
                 return;
             }
-            return; // unknown Ctrl combo: ignore
+            return; // unknown Ctrl/Cmd combo: ignore
         }
 
         $len = mb_strlen($buf['text']);
@@ -1522,6 +2225,11 @@ final class Canvas implements Backend
                 $this->emitInput($node, $buf);
                 break;
             default:
+                // Ignore unhandled "Mod+key" combos instead of inserting the
+                // literal label (e.g. "Alt+k") into the field.
+                if (preg_match('/^(Shift|Ctrl|Alt|Cmd)\+/', $text)) {
+                    break;
+                }
                 $ins = mb_strlen($text);
                 if ($ins >= 1 && $text !== "\r" && ord($text[0]) >= 0x20
                     && ($text !== "\n" || $node->type === 'textarea')) {
@@ -1538,6 +2246,15 @@ final class Canvas implements Backend
                 break;
         }
         $this->requestRedraw();
+    }
+
+    /** Strip a leading "Shift+/Ctrl+/Alt+/Cmd+" prefix so "Cmd+Alt+a" -> "a". */
+    private function stripModifiers(string $text): string
+    {
+        while (preg_match('/^(Shift|Ctrl|Alt|Cmd)\+(.+)$/', $text, $m)) {
+            $text = $m[2];
+        }
+        return $text;
     }
 
     private function pushUndo(array &$buf): void
@@ -2067,7 +2784,7 @@ final class Canvas implements Backend
                 Cairo::text($cr, $x + 8, $y + 18, (string) $el->prop('title', ''), 13, ...$this->col('text'));
                 break;
             case 'label':
-                Cairo::text($cr, $x, $y + 13, (string) $el->prop('text', ''), 13, ...$this->col('text'));
+                $this->renderElementText($cr, $el, $x, $y);
                 break;
             case 'heading':
                 Cairo::text($cr, $x, $y + 18, (string) $el->prop('text', ''), 18, ...$this->col('text'));
@@ -2606,12 +3323,18 @@ final class Canvas implements Backend
      * pixels as [y][x] => [r,g,b]. Headless snapshot readback (mirrors the
      * Reference backend's pixelsHash) used to verify painting — e.g. that a
      * scroll container clips its overflowing content.
+     *
+     * Forces a full compositor redraw so the returned pixels reflect the
+     * current widget state plus overlays.
      */
     public function offscreenPixels(): array
     {
         $f = Cairo::ffi();
         $w = $this->root ? (int) $this->root->prop('width', 320) : 320;
         $h = $this->root ? (int) $this->root->prop('height', 240) : 240;
+        // Force the compositor to do a full redraw to the host surface.
+        $this->compositor->markFullDirty();
+        // Create a temporary surface that paint() will blit to.
         $surf = $f->cairo_image_surface_create(0, $w, $h); // CAIRO_FORMAT_ARGB32
         $cr = $f->cairo_create($surf);
         $this->paint($cr);

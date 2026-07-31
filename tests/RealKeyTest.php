@@ -50,9 +50,9 @@ test('raw Tab keycode 48 moves focus forward', function () {
 test('raw Shift+Tab (keycode 48, shift) moves focus backward', function () {
     $auto = (new Automation(realKeyApp(), new Canvas(headless: true)))->start();
 
-    $auto->rawKey(48, true);           // Shift+Tab
+    $auto->rawKey(48, 1);           // Shift+Tab
     expect($auto->focusedId())->toBe('go-btn');
-    $auto->rawKey(48, true);
+    $auto->rawKey(48, 1);
     expect($auto->focusedId())->toBe('my-select');
 });
 
@@ -82,6 +82,6 @@ test('raw printable key (keycode 0, chars) inserts into the field', function () 
     $auto = (new Automation(realKeyApp(), new Canvas(headless: true)))->start();
 
     $auto->focus('a-input');
-    $auto->rawKey(0, false, 'z');
+    $auto->rawKey(0, 0, 'z');
     expect($auto->fieldText('a-input'))->toBe('z');
 });

@@ -31,7 +31,7 @@ case "$UNAME" in
     gtk_libs="$(pkg-config --libs gtk+-3.0 2>/dev/null || true)"
     [ -n "$gtk_cflags" ] && cflags+=($gtk_cflags)
     [ -n "$gtk_libs" ] && libs+=($gtk_libs)
-    libs+=(-lX11)
+    libs+=(-lX11 -lXi)
     ;;
   MINGW* | MSYS* | Windows_NT)
     platform_src="ext/win32.c"

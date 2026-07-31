@@ -46,3 +46,33 @@
 ## Resources
 - ui3: /Volumes/data/git/php/ui3/src/{Ui,App,Element,Backends/Canvas,Canvas/Layout,Canvas/Node,Automation,System}
 - native: /Volumes/data/git/web/native/src/{primitives, runtime, platform, automation, window_state, extensions, security, assets, js, bridge}
+
+## Native SDK Parity Gap Analysis (OS AppKit / Win32 / GTK)
+对比基准：**OS 原生 GUI SDK**（macOS AppKit / Windows Win32+GDI / Linux GTK/X11），而非 `web/native` 参考项目。
+结论：ui3 是「单画布手绘 UI 引擎」（类 Flutter/Compose），原生 `ext/libui3` 仅开 **一个** surface，事件仅 6 类（quit/down/up/move/key/wheel）。差距集中在 **OS 集成深度**，不在控件数量（Phase 1-10 已补齐 ~28 控件 + P0.x 文本编辑/剪切板/文件对话框/右键菜单）。
+
+### P0（阻断「像桌面 app」）
+- [x] **修饰键 + Cmd 捕获（最小验证已做）**：`cocoa.m` routeKey 仅算 shift/ctrl，丢弃 alt/cmd；`performKeyEquivalent` 让 Cmd+* 落回系统 → PHP 收不到 Cmd+C/V/X/Z/W/Q。现改为四位修饰键位掩码 + 全平台 `ui3_key_text` 统一前缀 + Cmd 路由（保留系统保留键）。
+- [ ] **多窗口是假的**：`ext/` 仅 `ui3_host_create` 一次（Canvas.php:781），`App::openWindow`/`Windows.php` 仅为 PHP 态，无第二个 OS 窗口。
+- [x] **窗口管理 API（核心已落地）**：`ext/` 新增 `ui3_host_set_title/resize/minimize/close/title/closed`（+ `width/height` 已由 P0 提供）原生 ABI，Cocoa/Win32/X11 三端 `ui3_plat_*` 钩子 + headless 状态一致；PHP 侧 `Canvas`/`App` 暴露 `setTitle/resize/minimize/close/title/isClosed/width/height`。`ui3_host_create` 现存储初始标题（修复 view 标题不生效的 bug）。剩余：move / fullscreen / acceptClose 未做。
+
+### P1（专业 app 必备）
+- [x] 原生菜单栏（NSMenu/系统顶栏）+ 状态栏 + 托盘（dock menu）
+  - 2026-07-30: 菜单栏打通（`ui3_host_set_menu` 文本协议 + `UI3_EVENT_MENU` + `click_menu`）；cocoa NSMenu（setMainMenu + 快捷键 keyEquivalent）/ win32 HMENU（SetMenu + WM_COMMAND）/ x11 no-op（raw-X11 无 menu bar）；`Ui::appMenu/appMenuItem/appMenuSeparator` + window `menu:` + headless 记录/点击 3 测试；状态栏/托盘待补
+- [x] 拖放 DnD（文件/文本/图片/URL）
+  - 2026-07-30: 文件/文本 DnD 打通（新增 `UI3_EVENT_DROP` + `ui3_host_inject_drop`）；cocoa `performDragOperation:`（文件 URL / 文本）、win32 `WM_DROPFILES`（文件）；x11 raw-X11 无 XDND（文档化为缺口，待 GTK widget 化后补）；headless 经 inject_drop → onDrop → App update 全链路验证 + 3 测试
+- [ ] OS 级手势（pinch/rotate/swipe/pan momentum）；`gesture()` 当前为手动合成
+- [x] 原生对话框（alert/sheet/color/font/print/about）；当前仅 open/save 文件
+  - 2026-07-30: alert/confirm/sheet/about 已打通（C ABI `ui3_host_dialog` + 三端 NSAlert/MessageBoxW/GtkMessageDialog + headless 预设结果 + 记录）；color/font/print 待补
+- [x] 通知中心（UNUserNotification / toast / libnotify）
+  - 2026-07-30: `ui3_host_notify` 打通；cocoa 用 NSUserNotificationCenter（deprecated 但仍可用），x11 用 notify-send（无需新依赖），win32 暂为 best-effort no-op（WinRT toast 待补）；headless 记录 lastNotify 可验证
+- [ ] 原生无障碍树（NSAccessibility / UIA / AT-SPI）；当前仅 PHP snapshot，VoiceOver/Narrator 读不到
+
+### P2（体验/性能/覆盖）
+- [ ] 富文本编辑 + 拼写检查 + IME 完整性（当前手绘 caret/selection/undo，无 rich text / spellcheck / autocorrect）
+- [ ] 剪贴板多格式（图片/RTF/fileURL）；当前仅 UTF-8 text
+- [ ] 性能：整树每帧重绘、无 compositor、无 GPU 层（webview/gpusurface 为占位）
+- [ ] 显示后端：Wayland / GTK4；移动端；真 WebView
+
+### 已具备（不重复造）
+DPI 原生处理（cocoa backingScaleFactor + cairo_scale）、跨平台键归一化、剪贴板/文件对话框、多级右键菜单、无障碍 snapshot、headless 可测。

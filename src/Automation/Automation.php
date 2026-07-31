@@ -170,15 +170,24 @@ final class Automation
     public function type(string $text): void
     {
         foreach (mb_str_split($text) as $ch) {
-            $this->backend->postKey(0, false, $ch);
+            $this->backend->postKey(0, 0, $ch);
             $this->backend->step();
         }
     }
 
-    /** Press a named key (e.g. 'Tab') through the real KEY event path. */
+    /** Press a named key (e.g. 'Tab', 'Ctrl+a', 'Shift+Tab') through the real
+     *  KEY event path. A leading "Shift+/Ctrl+/Alt+/Cmd+" prefix is folded into
+     *  the modifier mask (not the key text), matching the native key stream. */
     public function pressKey(string $key): void
     {
-        $this->backend->postKey(0, false, $key);
+        $modifiers = 0;
+        while (preg_match('/^(Shift|Ctrl|Alt|Cmd)\+(.+)$/', $key, $m)) {
+            $modifiers |= match ($m[1]) {
+                'Shift' => 1, 'Ctrl' => 2, 'Alt' => 4, 'Cmd' => 8,
+            };
+            $key = $m[2];
+        }
+        $this->backend->postKey(0, $modifiers, $key);
         $this->backend->step();
     }
 
@@ -197,21 +206,21 @@ final class Automation
     /** Press Arrow Up (browse a focused list/select). */
     public function arrowUp(): void
     {
-        $this->backend->postKey(0, false, "\x03");
+        $this->backend->postKey(0, 0, "\x03");
         $this->backend->step();
     }
 
     /** Press Arrow Down (browse a focused list/select). */
     public function arrowDown(): void
     {
-        $this->backend->postKey(0, false, "\x04");
+        $this->backend->postKey(0, 0, "\x04");
         $this->backend->step();
     }
 
     /** Press Enter (commit a list/select selection). */
     public function enter(): void
     {
-        $this->backend->postKey(36, false, "\n");
+        $this->backend->postKey(36, 0, "\n");
         $this->backend->step();
     }
 
@@ -220,9 +229,41 @@ final class Automation
      * translation the real Cocoa keyDown uses (#5c), so it routes through the
      * exact focus/Tab/text/browse logic a physical window would.
      */
-    public function rawKey(int $keycode, bool $shift = false, string $chars = ''): void
+    public function rawKey(int $keycode, int $modifiers = 0, string $chars = ''): void
     {
-        $this->backend->postKey($keycode, $shift, $chars);
+        $this->backend->postKey($keycode, $modifiers, $chars);
+        $this->step();
+    }
+
+    /**
+     * Simulate a drag-drop onto the window. $type 0=text 1=files; $payload is
+     * UTF-8 (newline-separated paths for files). Drives the SAME event path a
+     * native drop would (UI3_EVENT_DROP -> window onDrop).
+     */
+    public function drop(string $payload, int $type = 1, float $x = 0.0, float $y = 0.0): void
+    {
+        $this->backend->injectDrop($type, $x, $y, $payload);
+        $this->step();
+    }
+
+    /**
+     * Simulate clicking a menu item by its onClick message. Drives the SAME
+     * UI3_EVENT_MENU -> App dispatch path a native menu click would.
+     */
+    public function clickMenu(string $message): void
+    {
+        $this->backend->clickMenu($message);
+        $this->step();
+    }
+
+    /**
+     * Simulate a trackpad gesture at ($x,$y). $type 0=pinch 1=rotate 2=swipe;
+     * $value is the magnitude/direction string. Drives the SAME UI3_EVENT_GESTURE
+     * -> gesture target -> onGesture path a native gesture would.
+     */
+    public function gesture(int $type, float $x, float $y, string $value = ''): void
+    {
+        $this->backend->injectGesture($type, $x, $y, $value);
         $this->step();
     }
 

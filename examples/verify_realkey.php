@@ -42,7 +42,7 @@ echo "host headless? " . ($backend->isHeadless() ? "yes (no display)\n" : "no (r
 
 $backend->focus('user-in');
 foreach (str_split('alice') as $c) {
-    $backend->postKey(0, false, $c);
+    $backend->postKey(0, 0, $c);
 }
 $backend->step();
 

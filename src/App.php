@@ -166,6 +166,157 @@ final class App
         return $this->backend instanceof Backends\Canvas ? $this->backend->saveFile($defext) : null;
     }
 
+    /* ---- Window management (P1) — delegate to the native host backend ---- */
+
+    /** Set the native window title (no-op without a real Canvas window). */
+    public function setTitle(string $title): void
+    {
+        if ($this->backend instanceof Backends\Canvas) {
+            $this->backend->setTitle($title);
+        }
+    }
+
+    /** Resize the native window (no-op without a real Canvas window). */
+    public function resize(int $w, int $h): void
+    {
+        if ($this->backend instanceof Backends\Canvas) {
+            $this->backend->resize($w, $h);
+        }
+    }
+
+    /** Minimize the native window (no-op without a real Canvas window). */
+    public function minimize(): void
+    {
+        if ($this->backend instanceof Backends\Canvas) {
+            $this->backend->minimize();
+        }
+    }
+
+    /** Close the native host window (not a logical window). */
+    public function close(): void
+    {
+        if ($this->backend instanceof Backends\Canvas) {
+            $this->backend->close();
+        }
+    }
+
+    /** Current native window title ('' without a real Canvas window). */
+    public function title(): string
+    {
+        return $this->backend instanceof Backends\Canvas ? $this->backend->title() : '';
+    }
+
+    /** Whether the native host window has been closed. */
+    public function isClosed(): bool
+    {
+        return $this->backend instanceof Backends\Canvas && $this->backend->isClosed();
+    }
+
+    /** Move the native window to (x, y). */
+    public function move(int $x, int $y): void
+    {
+        if ($this->backend instanceof Backends\Canvas) {
+            $this->backend->move($x, $y);
+        }
+    }
+
+    /** Toggle native fullscreen mode. */
+    public function fullscreen(): void
+    {
+        if ($this->backend instanceof Backends\Canvas) {
+            $this->backend->fullscreen();
+        }
+    }
+
+    /**
+     * Set a callback invoked before the OS closes the window. Return false
+     * from the callback to block the close. Pass null to remove.
+     */
+    public function setCloseHandler(?callable $cb): void
+    {
+        if ($this->backend instanceof Backends\Canvas) {
+            $this->backend->setCloseHandler($cb);
+        }
+    }
+
+    /** Current window x position. */
+    public function x(): int
+    {
+        return $this->backend instanceof Backends\Canvas ? $this->backend->x() : 0;
+    }
+
+    /** Current window y position. */
+    public function y(): int
+    {
+        return $this->backend instanceof Backends\Canvas ? $this->backend->y() : 0;
+    }
+
+    /** Whether the window is in native fullscreen mode. */
+    public function isFullscreen(): bool
+    {
+        return $this->backend instanceof Backends\Canvas && $this->backend->isFullscreen();
+    }
+
+    /* ---- Native modal dialogs (P-Native P1) ---- */
+
+    /** Show a native alert (single OK button). */
+    public function alert(string $message, ?string $title = null): void
+    {
+        if ($this->backend instanceof Backends\Canvas) {
+            $this->backend->alert($message, $title);
+        }
+    }
+
+    /** Show a native confirm dialog; true when the first button is clicked. */
+    public function confirm(string $message, ?string $title = null): bool
+    {
+        return $this->backend instanceof Backends\Canvas && $this->backend->confirm($message, $title);
+    }
+
+    /** Show a native sheet (attached to the window where supported). */
+    public function sheet(string $message, ?string $title = null): void
+    {
+        if ($this->backend instanceof Backends\Canvas) {
+            $this->backend->sheet($message, $title);
+        }
+    }
+
+    /** Show a native About dialog (title + message, info style). */
+    public function about(string $title, string $message): void
+    {
+        if ($this->backend instanceof Backends\Canvas) {
+            $this->backend->about($title, $message);
+        }
+    }
+
+    /** Preset the value returned by dialogs in headless mode (automation). */
+    public function setDialogResult(int $result): void
+    {
+        if ($this->backend instanceof Backends\Canvas) {
+            $this->backend->setDialogResult($result);
+        }
+    }
+
+    /** Last dialog invocation recorded by the host, or null (automation). */
+    public function lastDialog(): ?array
+    {
+        return $this->backend instanceof Backends\Canvas ? $this->backend->lastDialog() : null;
+    }
+
+    /* ---- Native notification / toast (P-Native P1) ---- */
+
+    /** Show a native OS notification/toast. */
+    public function notify(string $title, string $body = ''): bool
+    {
+        return $this->backend instanceof Backends\Canvas && $this->backend->notify($title, $body);
+    }
+
+    /** Last notification recorded by the host, or null (automation). */
+    public function lastNotify(): ?array
+    {
+        return $this->backend instanceof Backends\Canvas ? $this->backend->lastNotify() : null;
+    }
+
     /** Register an extension hook at a lifecycle point (beforeRender/afterRender/afterUpdate). */
     public function extend(string $point, callable $hook): self
     {
@@ -182,11 +333,17 @@ final class App
     public function openWindow(string $id, string $title, int $width = 320, int $height = 240): self
     {
         $this->windows->open($id, $title, $width, $height);
+        if ($this->backend instanceof Backends\Canvas) {
+            $this->backend->createExtraHost($id, $title, $width, $height);
+        }
         return $this;
     }
 
     public function closeWindow(string $id): self
     {
+        if ($this->backend instanceof Backends\Canvas) {
+            $this->backend->destroyExtraHost($id);
+        }
         $this->windows->close($id);
         return $this;
     }

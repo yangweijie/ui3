@@ -324,8 +324,51 @@
 ## 5-Question Reboot Check
 | Question | Answer |
 |----------|--------|
-| Where am I? | 全部完成（Phase 1-10 + 测试脚本/示例 + P0 渲染底座/像素回归 + P1 常驻 ticker/文本测量 + P2 headless/IME/Reference 覆盖/Html 动画 + P3 Canvas IME parity/P2 示例） |
-| Where am I going? | — 收尾 —（scroll 裁剪已完成；右键菜单已增强至多级/图标/勾选态；剩余：GTK/Win32 原生路径需在 Linux+GTK / Windows 各构建一次确认，图标依赖运行环境字体字形支持） |
-| What's the goal? | 补齐十个方向(功能级最小实现) + 可运行示例与 CI 友好测试脚本 |
-| What have I learned? | bin/run.sh 可自动构建 libui3（UI3_SKIP_BUILD 跳过）；Html/systems 示例可不依赖原生库纯 PHP 运行 |
-| What have I done? | Phase 1-10 完成；测试脚本支持自动构建；新增 9 个示例覆盖各新能力；P1-P3 成熟度提升均带回归测试 |
+| Where am I? | Phase 1-10 + P0-P3 maturity + P-Native P0 (多窗口/窗口管理) + P-Native P1 (菜单栏/DnD/手势/对话框/通知/无障碍树) 全部完成 |
+| Where am I going? | P-Native P2 (富文本/剪贴板多格式/性能/Wayland/WebView) — 按优先级推进 |
+| What's the goal? | 十个方向 + 原生 SDK 集成深度对齐 |
+| What have I learned? | P-Native 分层架构：C ABI 声明 → common.c 共享逻辑 → platform hooks → PHP FFI 代理；无障碍树用 tab-delimited 文本协议避免 FFI 结构体生命周期问题 |
+| What have I done? | P-Native P0+P1 共 10 个相位落地（多窗口/窗口管理/move/fullscreen/acceptClose/菜单栏/DnD/手势/对话框/通知/无障碍树），全量测试 ~197 passed，无障碍树桥接 P1 最后一个 pending 项解决 |
+
+## P-Native P0: 多窗口 / 窗口管理 (2026-07-30)
+- **Status:** done
+- `ui3_host_create` 多实例 + `App::openWindow` 真正开第二个 OS 窗口
+- `Canvas` 新增 `extraHosts` 数组 + `createExtraHost/destroyExtraHost/extraHostCount`，`step()`/`quit()` 遍历全部 hosts
+- `App::openWindow()`/`closeWindow()` 通过 `Canvas` 代理，创建/销毁真实 OS 窗口
+- 9 headless 测试：`MultiWindowTest.php`
+- Verification: **192 passed / 0 failed / 1 skipped (602 assertions)**
+
+## P-Native P0 (续): 窗口管理 move/fullscreen/acceptClose (2026-07-30)
+- **Status:** done
+- `internal.h`: `x,y,fullscreen,close_cb,close_ctx` + `ui3_plat_move`/`ui3_plat_fullscreen` hook
+- `libui3.h`: `ui3_host_move/`fullscreen/`set_close_cb` + `x/y/fullscreen_state` getters
+- `common.c`: wrappers + null-check pattern
+- `cocoa.m`: `setFrameOrigin:`/`toggleFullScreen:`/`windowShouldClose:` delegate
+- `win32.c`: `SetWindowPos`/`ShowWindow`/`WM_CLOSE` handler
+- `x11.c`: `XMoveWindow`/`_NET_WM_STATE_FULLSCREEN`/`WM_DELETE_WINDOW` close_cb
+- FFI + `Canvas` + `App` PHP 层完整落地
+- `WindowMoveFullscreenTest.php` ×5 headless 测试
+- Verification: **182 passed / 0 failed / 1 skipped (585 assertions)**
+
+## P-Native P1: OS 手势 (2026-07-30)
+- **Status:** done
+- Cocoa: `magnifyWithEvent:`/`rotateWithEvent:`/`swipeWithEvent:`/`scrollWheel:` momentum phase
+- Win32: `WM_GESTURE` (RegisterTouchWindow + GetGestureInfo: GID_ZOOM→pinch/GID_ROTATE/GID_PAN/GID_TWOFINGERTAP→swipe)
+- X11: XI2 (XQueryExtension/XIQueryVersion/XISelectEvents + GenericEvent dispatch + touch tracking with 2-finger pinch distance/angle math + pan detection)
+- `build.sh`: Linux 加 `-lXi`
+- `GestureTest.php` ×4 headless 测试 (pinch/rotate/empty/pan)
+- Verification: **192 passed / 0 failed / 1 skipped (602 assertions)**
+
+## P-Native P1: 原生无障碍树桥接 (2026-07-30)
+- **Status:** done（macOS 完整桥接；Win32/X11 deferred stubs）
+- `libui3.h`: `ui3_a11y_node` 树结构 + `set_a11y_tree`(deep copy) + `set_a11y_text`(text→tree 解析) + `last_a11y`
+- `internal.h`: `last_a11y_tree`(headless 序列化缓存) + `plat_a11y`(native 深拷贝树) + `ui3_plat_accessibility` hook
+- `common.c`: `a11y_copy_node`/`a11y_free_tree`/`a11y_serialize`/`a11y_to_text` + `ui3_host_set_a11y_text` 13 字段 tab-delimited 解析 + 深度 parent stack
+- `cocoa.m`: `Ui3A11yElement`(NSAccessibilityElement: accessibilityChildren/Label/Description/Focus) + `Ui3View`(accessibilityChildren/Label/Description)
+- `win32.c`/`x11.c`: `ui3_plat_accessibility` stub（UIA/ATK 完整桥接 deferred）
+- `FFI/LibUi3.php`: `ui3_a11y_node` FFI struct + `set_a11y_tree`/`set_a11y_text`/`last_a11y`
+- `Canvas.php`: `flattenA11yTree`(Element→tab-delimited text) + `roleForType`(语义映射) + `boundsForElement`(Layout 坐标) + `buildA11yTree`(从 `update()` 自动调用) + `lastA11y()`
+- `tests/AccessibilityTest.php` ×5 headless 测试
+- Files: `ext/internal.h`, `ext/libui3.h`, `ext/common.c`, `ext/cocoa.m`, `ext/win32.c`, `ext/x11.c`, `ext/build.sh`, `src/FFI/LibUi3.php`, `src/Backends/Canvas.php`, `tests/AccessibilityTest.php`, `task_plan.md`
+- Verification: `tests/AccessibilityTest.php` **5 passed (13 assertions)**；相关子集（Accessibility+Gesture+MultiWindow）**18 passed (33 assertions)**；全量测试 **197 passed / 0 failed / 1 skipped**
+- Known bugs fixed: `$node->element`→`$node->el`（Node 属性名）；`__a11y_label`→`label`（Ui::accessible prop 名）；sscanf `[^%s]`→手动 tab 分割（空字段）；Canvas mount 必须调用；`$app->start()` 必须调用

@@ -16,14 +16,34 @@ final class Ui
     /** Monotonic counter for anonymous animated element ids. */
     private static int $animSeq = 0;
 
-    public static function window(string $title, array $children, int $width = 320, int $height = 240, ?string $id = null): Element
+    public static function window(string $title, array $children, int $width = 320, int $height = 240, ?string $id = null, ?string $onDrop = null, ?array $menu = null): Element
     {
         return new Element('window', [
             'title' => $title,
             'width' => $width,
             'height' => $height,
             'id' => $id,
+            'onDrop' => $onDrop,
+            'menu' => $menu,
         ], $children);
+    }
+
+    /** A top-level menu (label + items) for the window menu bar. */
+    public static function appMenu(string $label, array $items): array
+    {
+        return ['label' => $label, 'items' => $items];
+    }
+
+    /** A menu-bar item. $shortcut uses "Cmd+O" / "Ctrl+Shift+S" syntax. */
+    public static function appMenuItem(string $label, string $onClick, ?string $shortcut = null): array
+    {
+        return ['label' => $label, 'onClick' => $onClick, 'shortcut' => $shortcut ?? ''];
+    }
+
+    /** A menu-bar separator. */
+    public static function appMenuSeparator(): array
+    {
+        return ['separator' => true];
     }
 
     public static function column(array $children, ?string $id = null): Element

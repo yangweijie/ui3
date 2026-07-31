@@ -118,7 +118,9 @@
 - [x] `examples/ime.php`：Reference 接收 composition 事件并渲染待定预览（零 FFI）
 - [x] `examples/html_anim.php`：Html 后端把 `anim` 输出为 CSS `@keyframes`+`animation`（零 FFI）
 - [x] 修复 `Html::renderNode` 动画时长初值 `1000` 覆盖更短 `duration` → 改为 `0.0` 取 `max`
-- [x] `tests/CanvasImeTest.php`：Canvas 组合状态存储/清除/end 幂等
+- [x] `tests/CanvasImeTest.php`：Canvas 组合状态存储/清除 + 像素级 offscreenPixels 验证（preview 渲染/清除）+ App 端到端路由
+- [x] 修复 Compositor::beginFrame/endFrame blit 丢失 bug（beginFrame 清 fullDirty 后 endFrame 无 rect 可 blit → beginFrame 设 dirtyRects 为全表面 rect）
+- [x] 修复 Canvas::drawFieldText/drawSearch drawComposition 调用缺少 field buffer 时不渲染的 bug（移除 `$buf !== null` 守卫，drawComposition 自身已有 null 检查）
 - Status: done
 
 ### P4: scroll 内容裁剪（native SDK 支持）（成熟度提升）
@@ -203,11 +205,11 @@
   - 2026-07-30: `ui3_host_set/get_clipboard_image`（PNG bytes）、`set/get_clipboard_uris`（file:// URLs）、`set/get_clipboard_html`、`clipboard_formats`（UI3_CLIP_TEXT/IMAGE/FILES/HTML bitmask）；C ABI + common.c shared wrappers（headless 存 `last_clip_*` 字段）+ cocoa NSPasteboard（public.png / NSFilenamesPboardType / com.apple.html）+ win32 HTML Format（image/uris deferred）+ x11 GTK stubs；Canvas.php 7 个方法（setImage/getImage/setUris/getUris/setHtml/getHtml/formats）；5 headless 测试全部通过；Bug fix：`nativeClipboard()` 原本 `!$this->isHeadless()` 阻塞 headless 调用→改为 `$this->host !== null`；`ui3_host_set_clipboard_text` 平台函数未存 `last_clip_text`→三平台加 headless 存储
 - [x] compositor / GPU 层 / 局部重绘
 - [ ] Wayland / GTK4 / 移动端 / 真 WebView
-- Status: 剪贴板多格式 done（cocoa 全格式；win32 HTML 工作，image/uris deferred；x11 GTK stubs deferred）；富文本 done（bold/italic/underline/fontSize 标签 prop → Cairo + 5 回归测试）；compositor done（backing surface + dirty rect + partial blit + 16 unit tests）；拼写检查/IME 完整性/Wayland 仍 pending
+- Status: 剪贴板多格式 done（cocoa 全格式；win32 HTML 工作，image/uris deferred；x11 GTK stubs deferred）；富文本 done（bold/italic/underline/fontSize 标签 prop → Cairo + 5 回归测试）；compositor done（backing surface + dirty rect + partial blit + 16 unit tests）；IME 完整性 done（Canvas pixel-level offscreenPixels 测试 + App 端到端路由 + compositor blit 修复）；拼写检查/Wayland 仍 pending
 
 ## All phases complete
 十个方向全部补齐：主题/令牌、布局引擎、缺失组件、动画、事件/输入、状态/响应式、无障碍、多窗口、Web 目标、其他系统。P0–P1 渲染底座、动画/文本/IME 成熟度、scroll 裁剪与交互、文本编辑原语/剪切板/文件对话框、右键菜单增强与多级嵌套/图标/勾选态均已落地。
-另开 **P-Native（Native SDK Parity）** 跟踪块，对标 OS 原生 GUI SDK 补齐系统集成深度（P0 修饰键/Cmd 捕获、多窗口/窗口管理、菜单栏/托盘/DnD/手势/对话框/通知/无障碍树均 done；P2 剪贴板多格式 done（cocoa 全格式，win32 HTML 工作，image/uris/x11 GTK stubs deferred）；富文本 done（bold/italic/underline/fontSize 标签 prop → Cairo 渲染 + 5 回归测试）；compositor done（backing surface + dirty rect + partial blit + 16 单元测试）；拼写检查/IME 完整性/Wayland 等按 P2 推进）。
+另开 **P-Native（Native SDK Parity）** 跟踪块，对标 OS 原生 GUI SDK 补齐系统集成深度（P0 修饰键/Cmd 捕获、多窗口/窗口管理、菜单栏/托盘/DnD/手势/对话框/通知/无障碍树均 done；P2 剪贴板多格式 done（cocoa 全格式，win32 HTML 工作，image/uris/x11 GTK stubs deferred）；富文本 done（bold/italic/underline/fontSize 标签 prop → Cairo 渲染 + 5 回归测试）；compositor done（backing surface + dirty rect + partial blit + 16 单元测试）；IME 完整性 done（Canvas pixel-level 测试 + App 端到端路由 + compositor blit 修复）；拼写检查/Wayland 等按 P2 推进）。
 
 ## Key Decisions
 - 每方向三层(DSL+Canvas+自动化)最小实现，可被 MCP 观测。

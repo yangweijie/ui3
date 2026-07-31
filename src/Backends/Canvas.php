@@ -2367,9 +2367,7 @@ final class Canvas implements Backend
             $this->drawFieldSelection($cr, $text, $buf['sel'], $buf['cursor'], $x, $y, $padX);
         }
         Cairo::text($cr, $x, $y + 12, $show, 13, $tc[0], $tc[1], $tc[2]);
-        if ($buf !== null) {
-            $this->drawComposition($cr, $n->el, $text, $x, $y + 12, $w);
-        }
+        $this->drawComposition($cr, $n->el, $text, $x, $y + 12, $w);
         if ($buf !== null && $this->caretVisible()) {
             [$cx, $cy] = $this->fieldCaretXY($cr, $text, $buf['cursor'], $x, $y, $padX);
             Cairo::fillRect($cr, $cx, $cy, 1.2, 16, $tc[0], $tc[1], $tc[2]);
@@ -3142,11 +3140,11 @@ final class Canvas implements Backend
         $tx = $x + 28;
         $ty = $y + $h / 2 + 4;
         Cairo::text($cr, $tx, $ty, $showPlaceholder ? (string) $el->prop('placeholder', '') : $text, 13, ...$tc);
+        $this->drawComposition($cr, $el, $text, $tx, $ty, $w - 34);
         if ($buf !== null) {
             if ($buf['sel'] !== $buf['cursor']) {
                 $this->drawFieldSelection($cr, $text, $buf['sel'], $buf['cursor'], $tx, $ty - 12, 0);
             }
-            $this->drawComposition($cr, $el, $text, $tx, $ty, $w - 34);
             if ($this->caretVisible()) {
                 [$cx, $cy] = $this->fieldCaretXY($cr, $text, $buf['cursor'], $tx, $ty - 12, 0);
                 Cairo::fillRect($cr, $cx, $cy, 1.2, 16, ...$this->col('text'));

@@ -167,6 +167,8 @@ final class Compositor
         if ($this->fullDirty || $this->dirtyRects === []) {
             // Full clear
             Cairo::fillRect($this->backingCr, 0, 0, $this->w, $this->h, $bgR, $bgG, $bgB);
+            // Record the full rect so endFrame knows what to blit
+            $this->dirtyRects = [[0, 0, $this->w, $this->h]];
             $this->fullDirty = false;
         } else {
             // Clear only dirty rects

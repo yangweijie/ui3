@@ -412,14 +412,50 @@ void ui3_plat_clipboard_set_image(ui3_host *host, const void *data, int len)
         }
         return;
     }
-    (void)data; (void)len;
+    if (!data || len <= 0) return;
+    if (!OpenClipboard(NULL)) return;
+    EmptyClipboard();
+    /* Use a custom clipboard format so we round-trip PNG bytes
+     * verbatim.  CF_DIB requires a bitmap header which we cannot
+     * produce without a PNG decoder; our own format lets both ends
+     * of a ui3 clipboard transfer pass raw PNG bytes. */
+    UINT fmt = RegisterClipboardFormatA("UI3_IMAGE_PNG");
+    HGLOBAL h = GlobalAlloc(GMEM_MOVABLE, len);
+    if (h) {
+        void *p = GlobalLock(h);
+        if (p) {
+            memcpy(p, data, len);
+            GlobalUnlock(h);
+            SetClipboardData(fmt, h);
+        } else {
+            GlobalFree(h);
+        }
+    }
+    CloseClipboard();
 }
 
 const void *ui3_plat_clipboard_get_image(ui3_host *host, int *out_len)
 {
-    (void)host;
     if (out_len) *out_len = 0;
-    return NULL;
+    if (!OpenClipboard(NULL)) return NULL;
+    UINT fmt = RegisterClipboardFormatA("UI3_IMAGE_PNG");
+    HANDLE h = GetClipboardData(fmt);
+    const void *r = NULL;
+    if (h) {
+        void *p = GlobalLock(h);
+        SIZE_T sz = GlobalSize(h);
+        if (p) {
+            void *n = malloc((size_t)sz);
+            if (n) {
+                memcpy(n, p, (size_t)sz);
+                r = n;
+                if (out_len) *out_len = (int)sz;
+            }
+            GlobalUnlock(h);
+        }
+    }
+    CloseClipboard();
+    return r;
 }
 
 void ui3_plat_clipboard_set_uris(ui3_host *host, const char *uris)
@@ -429,13 +465,49 @@ void ui3_plat_clipboard_set_uris(ui3_host *host, const char *uris)
         host->last_clip_uris = uris ? strdup(uris) : NULL;
         return;
     }
-    (void)uris;
+    if (!uris) return;
+    if (!OpenClipboard(NULL)) return;
+    EmptyClipboard();
+    /* Store URIs in a custom format for round-trip fidelity.
+     * CF_HDROP requires file paths (no protocol prefix) and only
+     * conveys file paths — it cannot carry file:// URLs verbatim. */
+    UINT fmt = RegisterClipboardFormatA("UI3_URIS");
+    size_t L = strlen(uris) + 1;
+    HGLOBAL h = GlobalAlloc(GMEM_MOVABLE, L);
+    if (h) {
+        char *p = (char *)GlobalLock(h);
+        if (p) {
+            memcpy(p, uris, L);
+            GlobalUnlock(h);
+            SetClipboardData(fmt, h);
+        } else {
+            GlobalFree(h);
+        }
+    }
+    CloseClipboard();
 }
 
 const char *ui3_plat_clipboard_get_uris(ui3_host *host)
 {
     (void)host;
-    return "";
+    static char *g = NULL;
+    if (!OpenClipboard(NULL)) { free(g); g = NULL; return ""; }
+    UINT fmt = RegisterClipboardFormatA("UI3_URIS");
+    HANDLE h = GetClipboardData(fmt);
+    char *r = NULL;
+    if (h) {
+        char *p = (char *)GlobalLock(h);
+        if (p) {
+            size_t L = strlen(p);
+            r = (char *)malloc(L + 1);
+            if (r) memcpy(r, p, L + 1);
+            GlobalUnlock(h);
+        }
+    }
+    CloseClipboard();
+    free(g);
+    g = r;
+    return g ? g : "";
 }
 
 void ui3_plat_clipboard_set_html(ui3_host *host, const char *html, const char *base_url)

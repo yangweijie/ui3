@@ -693,6 +693,11 @@ int ui3_plat_notify(ui3_host *host, const char *title, const char *body)
  * menu-bar concept (the desktop shell provides app menus via GTK/GApplication).
  * Best-effort no-op: the call is recorded by common.c so headless automation
  * still works; a real X11 menu bar waits on a GTK widget backend. */
+/* The raw-X11 backend has no GtkWidget to host a GtkHeaderBar/GtkMenuBar.
+ * A native menu bar needs a GTK-based canvas widget (provided by the GTK4
+ * backend — set UI3_BACKEND=gtk4).  raw X11 cannot embed a GTK titlebar
+ * around an X11 window without reparenting the drawing surface, which breaks
+ * the Cairo Xlib surface.  Documented as a known limitation. */
 void ui3_plat_set_menu(ui3_host *host, const char *menu)
 {
     (void)host; (void)menu;

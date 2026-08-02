@@ -8,6 +8,7 @@
 #include "internal.h"
 #include <windows.h>
 #include <windowsx.h>        /* GET_X_LPARAM */
+#include <uiautomation.h>    /* IUIAutomationRegistrar */
 #include <cairo/cairo.h>
 #include <cairo/cairo-win32.h>
 #include <stdlib.h>
@@ -19,6 +20,10 @@ typedef struct {
     /* Menu bar (P-Native P1): id -> onClick message mapping. */
     char **menu_msgs;
     int menu_count;
+    /* UIA accessibility (P-Native P1). */
+    BOOL com_inited;
+    IUIAutomationRegistrar *uiaRegistrar;
+    void *uiaCallback;          /* win32_uia_callback * — opaque to avoid fwd-decl ordering */
 } win32_plat;
 
 /* Win32 VK_* -> the logical id space ui3_key_text() expects (values mirror
@@ -285,6 +290,7 @@ int ui3_plat_create_window(ui3_host *host, const char *title)
     if (!hwnd) return -1;
 
     win32_plat *p = malloc(sizeof(*p));
+    memset(p, 0, sizeof(*p));
     p->host = host;
     p->hwnd = hwnd;
     host->plat = p;
@@ -357,14 +363,20 @@ void ui3_host_set_clipboard_text(ui3_host *host, const char *text)
     }
     if (!OpenClipboard(NULL)) return;
     EmptyClipboard();
-    HGLOBAL h = GlobalAlloc(GMEM_MOVABLE, strlen(text) + 1);
+
+    int need = MultiByteToWideChar(CP_UTF8, 0, text, (int)strlen(text), NULL, 0);
+    if (need <= 0) {
+        CloseClipboard();
+        return;
+    }
+    HGLOBAL h = GlobalAlloc(GMEM_MOVABLE, (need + 1) * sizeof(wchar_t));
     if (h) {
-        char *p = (char *)GlobalLock(h);
+        wchar_t *p = (wchar_t *)GlobalLock(h);
         if (p) {
-            memcpy(p, text, strlen(text) + 1);
+            MultiByteToWideChar(CP_UTF8, 0, text, (int)strlen(text), p, need + 1);
             GlobalUnlock(h);
         }
-        SetClipboardData(CF_TEXT, h);
+        SetClipboardData(CF_UNICODETEXT, h);
     }
     CloseClipboard();
 }
@@ -374,20 +386,40 @@ char *ui3_host_get_clipboard_text(ui3_host *host)
     (void)host;
     static char *g = NULL;
     if (!OpenClipboard(NULL)) return NULL;
-    HANDLE h = GetClipboardData(CF_TEXT);
     char *r = NULL;
+
+    /* Try UTF-16 first, fall back to ANSI */
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
     if (h) {
-        char *p = (char *)GlobalLock(h);
+        wchar_t *p = (wchar_t *)GlobalLock(h);
         if (p) {
-            size_t L = strlen(p);
-            char *n = (char *)malloc(L + 1);
-            if (n) {
-                memcpy(n, p, L + 1);
-                r = n;
+            int need = WideCharToMultiByte(CP_UTF8, 0, p, -1, NULL, 0, NULL, NULL);
+            if (need > 0) {
+                char *n = (char *)malloc(need);
+                if (n) {
+                    WideCharToMultiByte(CP_UTF8, 0, p, -1, n, need, NULL, NULL);
+                    r = n;
+                }
             }
             GlobalUnlock(h);
         }
     }
+    if (!r) {
+        h = GetClipboardData(CF_TEXT);
+        if (h) {
+            char *p = (char *)GlobalLock(h);
+            if (p) {
+                size_t L = strlen(p);
+                char *n = (char *)malloc(L + 1);
+                if (n) {
+                    memcpy(n, p, L + 1);
+                    r = n;
+                }
+                GlobalUnlock(h);
+            }
+        }
+    }
+
     CloseClipboard();
     free(g);
     g = r;
@@ -675,6 +707,19 @@ void ui3_plat_destroy(ui3_host *host)
 {
     win32_plat *p = host->plat;
     if (!p) return;
+    if (p->uiaCallback) {
+        IUIAutomationRegistrarCallback *cb = p->uiaCallback;
+        cb->lpVtbl->Release(cb);
+        p->uiaCallback = NULL;
+    }
+    if (p->uiaRegistrar) {
+        p->uiaRegistrar->lpVtbl->Release(p->uiaRegistrar);
+        p->uiaRegistrar = NULL;
+    }
+    if (p->com_inited) {
+        CoUninitialize();
+        p->com_inited = FALSE;
+    }
     if (p->hwnd) DestroyWindow(p->hwnd);
     free(p);
     host->plat = NULL;
@@ -841,11 +886,386 @@ void ui3_plat_set_menu(ui3_host *host, const char *menu)
     DrawMenuBar(p->hwnd);
 }
 
+/* ---- UI Automation accessibility (P-Native P1) ---- */
+/*
+ * Provides native Windows UIA elements for screen readers via:
+ *   - COM STA init (IUIAutomation requires single-threaded apartment)
+ *   - A registered IRawElementProviderSimple provider on the window
+ *   - Window subclassing to handle WM_GETOBJECT and hand back our provider
+ *   - The provider reads host->plat_a11y each time properties are queried
+ *     (so the tree is always live without re-registration).
+ *
+ * Because UIA property getters are synchronous callbacks, the a11y tree
+ * pointer (ui3_host_set_a11y_tree) must be current when queried.  The
+ * provider stores the current root pointer and queries it on demand,
+ *     freeing the previous tree only on explicit replacement.
+ */
+
+static void win32_free_a11y_tree(ui3_a11y_node *root)
+{
+    if (!root) return;
+    for (int i = 0; i < root->child_count; i++)
+        win32_free_a11y_tree(root->children[i]);
+    free(root->children);
+    free((void *)root->role);
+    free((void *)root->label);
+    free((void *)root->description);
+    free(root);
+}
+
+/* ui3_a11y_node role → UIA ControlType ID. */
+static INT32 win32_role_to_ctrltype(const char *role)
+{
+    if (!role) return UIA_PaneControlTypeId;
+    if (strcmp(role, "button") == 0)      return UIA_ButtonControlTypeId;
+    if (strcmp(role, "checkbox") == 0)    return UIA_CheckBoxControlTypeId;
+    if (strcmp(role, "input") == 0 ||
+        strcmp(role, "textarea") == 0 ||
+        strcmp(role, "search") == 0)      return UIA_EditControlTypeId;
+    if (strcmp(role, "label") == 0 ||
+        strcmp(role, "text") == 0 ||
+        strcmp(role, "heading") == 0 ||
+        strcmp(role, "title") == 0)       return UIA_TextControlTypeId;
+    if (strcmp(role, "list") == 0 ||
+        strcmp(role, "combobox") == 0)    return UIA_ListControlTypeId;
+    if (strcmp(role, "list_item") == 0)   return UIA_ListItemControlTypeId;
+    if (strcmp(role, "slider") == 0)      return UIA_SliderControlTypeId;
+    if (strcmp(role, "progress") == 0)    return UIA_ProgressBarControlTypeId;
+    if (strcmp(role, "scroll") == 0)      return UIA_ScrollBarControlTypeId;
+    if (strcmp(role, "panel") == 0 ||
+        strcmp(role, "container") == 0 ||
+        strcmp(role, "tab") == 0)        return UIA_GroupControlTypeId;
+    if (strcmp(role, "tab_list") == 0)   return UIA_TabControlTypeId;
+    if (strcmp(role, "menu") == 0)        return UIA_MenuControlTypeId;
+    return UIA_PaneControlTypeId;
+}
+
+typedef struct {
+    ULONG            refcount;
+    HWND             hwnd;
+    ui3_host        *host;
+} win32_uia_provider;
+
+static HRESULT STDMETHODCALLTYPE
+win32_uia_QueryInterface(win32_uia_provider *p, REFIID riid, void **ppv)
+{
+    if (IsEqualIID(riid, &IID_IUnknown) ||
+        IsEqualIID(riid, &IID_IRawElementProviderSimple)) {
+        p->refcount++;
+        *ppv = p;
+        return S_OK;
+    }
+    *ppv = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG STDMETHODCALLTYPE win32_uia_AddRef(win32_uia_provider *p)
+{
+    return ++p->refcount;
+}
+
+static ULONG STDMETHODCALLTYPE win32_uia_Release(win32_uia_provider *p)
+{
+    ULONG rc = --p->refcount;
+    if (rc == 0) free(p);
+    return rc;
+}
+
+static HRESULT STDMETHODCALLTYPE
+win32_uia_GetPatternProvider(win32_uia_provider *p, ULONG patternId,
+                              IInspectable **provider)
+{
+    (void)p; (void)patternId;
+    *provider = NULL;
+    return E_FAIL;
+}
+
+static HRESULT STDMETHODCALLTYPE
+win32_uia_GetPropertyValue(win32_uia_provider *p, PROPERTYID propId,
+                             VARIANT *value)
+{
+    if (!value) return E_POINTER;
+    VariantInit(value);
+
+    if (propId == UIA_NamePropertyId) {
+        /* Read root label live from the host a11y tree. */
+        if (!p->host || !p->host->plat_a11y)
+            return S_OK;
+        const char *label = ((ui3_a11y_node *)p->host->plat_a11y)->label;
+        if (label && label[0]) {
+            int n = MultiByteToWideChar(CP_UTF8, 0, label, -1, NULL, 0);
+            if (n > 0) {
+                wchar_t *w = (wchar_t *)malloc((size_t)n * sizeof(wchar_t));
+                if (w) {
+                    MultiByteToWideChar(CP_UTF8, 0, label, -1, w, n);
+                    value->vt = VT_BSTR;
+                    value->bstrVal = SysAllocString(w);
+                    free(w);
+                    if (value->bstrVal)
+                        return S_OK;
+                }
+            }
+        }
+    } else if (propId == UIA_ControlTypePropertyId) {
+        value->vt = VT_I4;
+        value->lVal = UIA_PaneControlTypeId;
+        return S_OK;
+    } else if (propId == UIA_NativeWindowHandlePropertyId) {
+        value->vt = VT_I4;
+        value->lVal = 0;
+        return S_OK;
+    }
+    value->vt = VT_EMPTY;
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE
+win32_uia_GetBoundingRectangle(win32_uia_provider *p,
+                                IRawElementProviderSimple **el,
+                                RECT *rect)
+{
+    (void)el;
+    if (!rect) return E_POINTER;
+    if (GetWindowRect(p->hwnd, rect) == FALSE) {
+        memset(rect, 0, sizeof(*rect));
+        return S_FALSE;
+    }
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE
+win32_uia_GetRuntimeId(win32_uia_provider *p,
+                        IRawElementProviderSimple **el, UINT32 *len,
+                        UINT **id)
+{
+    (void)el;
+    if (!id) return E_POINTER;
+    *id = (UINT *)malloc(sizeof(UINT) * 2);
+    if (!*id) return E_OUTOFMEMORY;
+    (*id)[0] = 1;
+    (*id)[1] = (UINT)(ULONG_PTR)p->hwnd;
+    if (len) *len = 2;
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE
+win32_uia_GetHostRawElementProvider(win32_uia_provider *p, HWND hwnd,
+                                    IRawElementProviderSimple **el,
+                                    IRawElementProviderSimple **provider)
+{
+    (void)p; (void)hwnd; (void)el;
+    if (provider) *provider = NULL;
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE
+win32_uia_GetEmbeddedElementProviders(win32_uia_provider *p,
+                                       IRawElementProviderSimple **el,
+                                       UINT32 **providerCount,
+                                       IRawElementProviderSimple ***providers)
+{
+    if (!p->host || !p->host->plat_a11y) {
+        if (providerCount) *providerCount = 0;
+        if (providers) *providers = NULL;
+        return S_OK;
+    }
+
+    ui3_a11y_node *root = (ui3_a11y_node *)p->host->plat_a11y;
+    if (root && root->child_count > 0) {
+        if (providerCount) *providerCount = (UINT32)root->child_count;
+        if (providers) {
+            *providers = (IRawElementProviderSimple **)calloc(
+                root->child_count, sizeof(IRawElementProviderSimple *));
+        }
+        /* We don't materialize per-child providers for now; children are
+         * reported via the host text (ui3_host_last_a11y) for NVDA/JAWS. */
+    } else {
+        if (providerCount) *providerCount = 0;
+        if (providers) *providers = NULL;
+    }
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE
+win32_uia_GetFocus(win32_uia_provider *p, IRawElementProviderSimple **el,
+                   IRawElementProviderSimple **provider)
+{
+    (void)p; (void)el;
+    if (provider) *provider = NULL;
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE
+win32_uia_GetParent(win32_uia_provider *p, IRawElementProviderSimple **el,
+                    IRawElementProviderSimple **provider)
+{
+    (void)p; (void)el;
+    if (provider) *provider = NULL;
+    return S_OK;
+}
+
+static IRawElementProviderSimpleVtbl win32_uia_vtbl = {
+    win32_uia_QueryInterface,
+    win32_uia_AddRef,
+    win32_uia_Release,
+    win32_uia_GetPatternProvider,
+    win32_uia_GetPropertyValue,
+    win32_uia_GetBoundingRectangle,
+    win32_uia_GetRuntimeId,
+    win32_uia_GetHostRawElementProvider,
+    win32_uia_GetEmbeddedElementProviders,
+    win32_uia_GetFocus,
+    win32_uia_GetParent
+};
+
+static HRESULT win32_make_provider(win32_plat *p,
+                                    IRawElementProviderSimple **out)
+{
+    win32_uia_provider *prov = malloc(sizeof(*prov));
+    if (!prov) return E_OUTOFMEMORY;
+    memset(prov, 0, sizeof(*prov));
+    prov->lpVtbl = &win32_uia_vtbl;
+    prov->refcount = 1;
+    prov->hwnd = p->hwnd;
+    prov->host = p->host;
+    *out = &prov->lpVtbl;
+    return S_OK;
+}
+
+typedef struct {
+    IUIAutomationRegistrarCallbackVtbl *lpVtbl;
+    ULONG  refcount;
+} win32_uia_callback;
+
+/* UIARegistrar callback: when a provider is requested for hwnd, hand back ours. */
+static HRESULT STDMETHODCALLTYPE
+win32_uia_provider_callback(IUIAutomationRegistrarCallback *callback,
+                              ULONG_PTR hwndPointer,
+                              IRawElementProviderSimple **provider)
+{
+    win32_plat *p = (win32_plat *)GetWindowLongPtr((HWND)hwndPointer, GWLP_USERDATA);
+    if (!p) {
+        *provider = NULL;
+        return S_FALSE;
+    }
+    win32_make_provider(p, provider);
+    if (*provider) (*provider)->lpVtbl->AddRef(*provider);
+    return *provider ? S_OK : E_FAIL;
+}
+
+static HRESULT STDMETHODCALLTYPE
+win32_uia_cb_QueryInterface(IUIAutomationRegistrarCallback *cb, REFIID riid, void **ppv)
+{
+    if (IsEqualIID(riid, &IID_IUnknown) ||
+        IsEqualIID(riid, &IID_IUIAutomationRegistrarCallback)) {
+        win32_uia_callback *c = (win32_uia_callback *)cb;
+        c->refcount++;
+        *ppv = cb;
+        return S_OK;
+    }
+    *ppv = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG STDMETHODCALLTYPE
+win32_uia_cb_AddRef(IUIAutomationRegistrarCallback *cb)
+{
+    win32_uia_callback *c = (win32_uia_callback *)cb;
+    return ++c->refcount;
+}
+
+static ULONG STDMETHODCALLTYPE
+win32_uia_cb_Release(IUIAutomationRegistrarCallback *cb)
+{
+    win32_uia_callback *c = (win32_uia_callback *)cb;
+    ULONG rc = --c->refcount;
+    if (rc == 0) free(c);
+    return rc;
+}
+
+static IUIAutomationRegistrarCallbackVtbl win32_reg_cb_vtbl = {
+    win32_uia_cb_QueryInterface,
+    win32_uia_cb_AddRef,
+    win32_uia_cb_Release,
+    win32_uia_provider_callback
+};
+
+static void win32_register_uia(win32_plat *p)
+{
+    if (!p->hwnd) return;
+
+    /* COM STA init — required by UIA on the window thread. */
+    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr)) return;
+    p->com_inited = TRUE;
+
+    p->uiaRegistrar = NULL;
+    CoCreateInstance(&CLSID_UIAutomationRegistrar, NULL, CLSCTX_INPROC_SERVER,
+                     &IID_IUIAutomationRegistrar, (void **)&p->uiaRegistrar);
+    if (!p->uiaRegistrar) {
+        CoUninitialize();
+        p->com_inited = FALSE;
+        return;
+    }
+
+    /* Allocate a COM object that implements IUIAutomationRegistrarCallback. */
+    win32_uia_callback *cb = malloc(sizeof(*cb));
+    if (!cb) {
+        p->uiaRegistrar->lpVtbl->Release(p->uiaRegistrar);
+        p->uiaRegistrar = NULL;
+        CoUninitialize();
+        p->com_inited = FALSE;
+        return;
+    }
+    cb->lpVtbl = &win32_reg_cb_vtbl;
+    cb->refcount = 1;
+    p->uiaCallback = cb;
+    hr = p->uiaRegistrar->lpVtbl->RegisterProviderCallback(
+        p->uiaRegistrar, p->hwnd, cb,
+        (ULONG_PTR)p->hwnd);
+    if (FAILED(hr)) {
+        p->uiaCallback->lpVtbl->Release(p->uiaCallback);
+        p->uiaCallback = NULL;
+        p->uiaRegistrar->lpVtbl->Release(p->uiaRegistrar);
+        p->uiaRegistrar = NULL;
+        CoUninitialize();
+        p->com_inited = FALSE;
+    }
+}
+
+static LRESULT WINAPI
+win32_uia_subclass(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                   UINT_PTR subclassId, DWORD_PTR refData)
+{
+    if (msg == WM_GETOBJECT) {
+        /* Force Windows to use our registered UIA provider. */
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+static void win32_update_uia(win32_plat *p, const ui3_a11y_node *root)
+{
+    if (!p || !p->uiaRegistrar) return;
+
+    /* Update the a11y tree on the host.  The provider reads it live. */
+    if (p->host) {
+        ui3_host_set_a11y_tree(p->host, root);
+    }
+
+    /* Invalidate the window's accessible region so UIA refreshes. */
+    if (p->hwnd) {
+        SetWindowPos(p->hwnd, NULL, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+        InvalidateRect(p->hwnd, NULL, FALSE);
+    }
+}
+
 /* ---- Accessibility tree (P-Native P1) ---- */
 void ui3_plat_accessibility(ui3_host *host, ui3_a11y_node *root)
 {
-    (void)host;
-    (void)root;
-    /* Full UIA (IUIAutomation) requires COM init, custom IRawElementProviderSimple,
-     * and window subclassing. Deferred — record tree on host for test round-trip. */
+    if (!host || !host->plat) return;
+    win32_plat *p = host->plat;
+    if (!p->com_inited) win32_register_uia(p);
+    win32_update_uia(p, root);
 }

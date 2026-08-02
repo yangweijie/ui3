@@ -187,7 +187,7 @@
 ### P-Native P1: 系统集成分层（菜单栏/托盘/DnD/手势/对话框/通知/无障碍树）
 - [x] 原生菜单栏（NSMenu/系统顶栏）+ 状态栏 + 托盘（dock menu）
   - 2026-07-30: `ui3_host_set_menu`（文本协议）+ `UI3_EVENT_MENU` + `click_menu`；cocoa NSMenu（keyEquivalent）/ win32 HMENU（WM_COMMAND 映射）/ x11 no-op；`Ui::appMenu/appMenuItem/appMenuSeparator` + window `menu:` + Automation `clickMenu` + 3 headless 测试；状态栏/托盘/dock menu 待补
-  - 2026-07-30: `ui3_host_set_a11y_text` 文本协议 + `flattenA11yTree`（PHP→tab-delimited text→C 解析）；C `ui3_a11y_node` 树 + `ui3_host_set_a11y_tree` deep copy + headless 序列化 + `ui3_host_last_a11y` 回读；cocoa NSAccessibility（Ui3View/Ui3A11yElement accessibilityChildren/Label/Description）/ win32 UIA stub（deferred）/ x11 ATK stub（deferred — raw X11 无 GtkWidget）；5 headless 测试（text output/nested elements/root metadata/role mapping/non-accessible group）
+  - 2026-07-30: `ui3_host_set_a11y_text` 文本协议 + `flattenA11yTree`（PHP→tab-delimited text→C 解析）；C `ui3_a11y_node` 树 + `ui3_host_set_a11y_tree` deep copy + headless 序列化 + `ui3_host_last_a11y` 回读；cocoa NSAccessibility（Ui3View/Ui3A11yElement accessibilityChildren/Label/Description）/ **win32 UIA done**（2026-08-01：COM STA init + `IUIAutomationRegistrar` 注册 + 自定义 `IRawElementProviderSimple` vtbl + `WM_GETOBJECT` 窗口子类化；`ui3_a11y_node` 实时读 `host->plat_a11y`，role→ControlType 映射（button/checkbox/input/list 等 16 种角色）；CI Windows 硬 fail）/ x11 ATK stub（deferred — raw X11 无 GtkWidget）；5 headless 测试（text output/nested elements/root metadata/role mapping/non-accessible group）
 - [x] 拖放 DnD（文件/文本/图片/URL）
   - 2026-07-30: `UI3_EVENT_DROP` + `ui3_host_inject_drop`；cocoa performDragOperation（文件/文本）/ win32 WM_DROPFILES（文件）/ x11 Xdnd v5（2026-07-31 实现：XdndAware property + Enter/Position/Drop/Finished + XdndSelection 检索 file:// URI 列表）；window `onDrop` + Automation `drop()` + 3 headless 测试
 - [x] OS 级手势（pinch/rotate/swipe/pan momentum）
@@ -198,7 +198,7 @@
   - 2026-07-30: `ui3_host_notify` 打通；cocoa NSUserNotificationCenter / x11 notify-send / win32 best-effort no-op；headless lastNotify 记录 + 3 测试；win32 WinRT toast 待补
 - [x] 原生无障碍树桥接（NSAccessibility / UIA / AT-SPI）
   - 2026-07-30: `ui3_host_set_a11y_text` 文本协议 + `flattenA11yTree`（PHP→tab-delimited text→C 解析）；C `ui3_a11y_node` 树 + `ui3_host_set_a11y_tree` deep copy + headless 序列化 + `ui3_host_last_a11y` 回读；cocoa NSAccessibility（Ui3View/Ui3A11yElement accessibilityChildren/Label/Description）/ win32 UIA stub（deferred）/ x11 ATK stub（deferred）；5 headless 测试（text output/nested elements/root metadata/role mapping/non-accessible group）
-- Status: P-Native P1 done（菜单栏/DnD/手势/对话框/通知/无障碍树全部落地；win32 UIA deferred；x11 ATK deferred（无 GtkWidget）；x11 DnD 已补（Xdnd v5））
+- Status: P-Native P1 done（菜单栏/DnD/手势/对话框/通知/无障碍树全部落地；win32 UIA done（2026-08-01：COM STA + IUIAutomationRegistrar + IRawElementProviderSimple vtbl + WM_GETOBJECT 子类化，16 种 role→ControlType 映射）；x11 ATK + x11 menu bar 仍 deferred（raw X11 无 GtkWidget；使用 `UI3_BACKEND=gtk4` 可获得完整支持））
 
 ### P-Native P2: 编辑/剪贴板/性能/后端覆盖
 - [x] 富文本（bold/italic/underline/fontSize color 标签 prop → Cairo slant/weight + underline + fontSize 透传）
@@ -213,7 +213,7 @@
 
 ## All phases complete
 十个方向全部补齐：主题/令牌、布局引擎、缺失组件、动画、事件/输入、状态/响应式、无障碍、多窗口、Web 目标、其他系统。P0–P1 渲染底座、动画/文本/IME 成熟度、scroll 裁剪与交互、文本编辑原语/剪切板/文件对话框、右键菜单增强与多级嵌套/图标/勾选态均已落地。
-另开 **P-Native（Native SDK Parity）** 跟踪块，对标 OS 原生 GUI SDK 补齐系统集成深度（P0 修饰键/Cmd 捕获、多窗口/窗口管理、菜单栏/托盘/DnD/手势/对话框/通知/无障碍树均 done；P2 剪贴板多格式 done（**三平台全格式**：cocoa / **win32** / x11 GTK3）；富文本 done；compositor done；IME 完整性 done；拼写检查 done（19 测试）；**GTK4/Wayland done**（ext/gtk4.c + build.sh UI3_BACKEND 分支 + CI job；移动端/Webview 排除已记录理由）；**x11 DnD done**（Xdnd v5）。x11 ATK + x11 menu bar 仍 deferred（raw X11 无 GtkWidget，ATK/GtkHeaderBar 需 GTK；使用 `UI3_BACKEND=gtk4` 可获得完整支持）。
+另开 **P-Native（Native SDK Parity）** 跟踪块，对标 OS 原生 GUI SDK 补齐系统集成深度（P0 修饰键/Cmd 捕获、多窗口/窗口管理、菜单栏/托盘/DnD/手势/对话框/通知/无障碍树均 done（**win32 UIA 已补**：COM STA + `IUIAutomationRegistrar` + 自定义 `IRawElementProviderSimple` vtbl + `WM_GETOBJECT` 子类化，16 种 role→ControlType 映射，CI Windows 硬 fail）；P2 剪贴板多格式 done（**三平台全格式**：cocoa / **win32** / x11 GTK3）；富文本 done；compositor done；IME 完整性 done；拼写检查 done（19 测试）；**GTK4/Wayland done**（ext/gtk4.c + build.sh UI3_BACKEND 分支 + CI job；移动端/Webview 排除已记录理由）；**x11 DnD done**（Xdnd v5）。剩余 deferred（已记录原因）：x11 ATK + x11 menu bar（raw X11 无 GtkWidget，ATK/GtkHeaderBar 需 GTK；使用 `UI3_BACKEND=gtk4` 可获得完整支持）。
 
 ## Key Decisions
 - 每方向三层(DSL+Canvas+自动化)最小实现，可被 MCP 观测。

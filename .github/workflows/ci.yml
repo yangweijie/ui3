@@ -15,9 +15,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
         include:
-          # Windows backend is implemented but untested in this repo's CI loop.
           - os: windows-latest
-            continue-on-error: true
     runs-on: ${{ matrix.os }}
 
     steps:

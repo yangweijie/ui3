@@ -56,3 +56,35 @@ test("combined bold + italic + underline + fontSize renders without error", func
     $snap = $a->snapshot();
     expect(Snapshot::findById($snap, 'l5')['name'])->toBe('T5');
 });
+
+test("color prop (red #ff0000) renders without error", function () {
+    $a = new Automation(
+        new App(
+            init: fn (): array => [],
+            update: fn (array $m, string $msg, mixed $payload = null): array => $m,
+            view: fn (array $m): Element => Ui::window('W', [
+                new Element('label', ['text' => 'Red', 'id' => 'l6', 'color' => '#ff0000']),
+            ], width: 200, height: 60),
+        ),
+        new Canvas(headless: true)
+    );
+    $a->start();
+    $snap = $a->snapshot();
+    expect(Snapshot::findById($snap, 'l6')['name'])->toBe('Red');
+});
+
+test("color prop with combined bold + italic + fontSize renders without error", function () {
+    $a = new Automation(
+        new App(
+            init: fn (): array => [],
+            update: fn (array $m, string $msg, mixed $payload = null): array => $m,
+            view: fn (array $m): Element => Ui::window('W', [
+                new Element('label', ['text' => 'Styled', 'id' => 'l7', 'color' => '#00ff00', 'bold' => true, 'italic' => true, 'fontSize' => 20]),
+            ], width: 200, height: 60),
+        ),
+        new Canvas(headless: true)
+    );
+    $a->start();
+    $snap = $a->snapshot();
+    expect(Snapshot::findById($snap, 'l7')['name'])->toBe('Styled');
+});

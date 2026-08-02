@@ -55,7 +55,6 @@ jobs:
   # GTK4 backend (Linux) — native Wayland/X11-capable GTK4 build.
   test-gtk4:
     runs-on: ubuntu-latest
-    continue-on-error: true
 
     steps:
       - uses: actions/checkout@v4
@@ -79,5 +78,8 @@ jobs:
       - name: Build libui3 with GTK4 backend
         run: UI3_BACKEND=gtk4 bash ext/build.sh
 
-      - name: Run headless smoke test
-        run: PHPC_SKIP_GUI=1 php -d ffi.enable=true vendor/bin/pest --filter=Clipboard 2>/dev/null || true
+      - name: Run headless smoke tests (gtk4 backend)
+        run: |
+          export UI3_BACKEND=gtk4
+          PHPC_SKIP_GUI=1 php -d ffi.enable=true vendor/bin/pest --no-coverage \
+            --filter="Clipboard|RichText|Compositor|WidgetsParity" 2>&1

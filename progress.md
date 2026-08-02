@@ -372,3 +372,26 @@
 - Files: `ext/internal.h`, `ext/libui3.h`, `ext/common.c`, `ext/cocoa.m`, `ext/win32.c`, `ext/x11.c`, `ext/build.sh`, `src/FFI/LibUi3.php`, `src/Backends/Canvas.php`, `tests/AccessibilityTest.php`, `task_plan.md`
 - Verification: `tests/AccessibilityTest.php` **5 passed (13 assertions)**；相关子集（Accessibility+Gesture+MultiWindow）**18 passed (33 assertions)**；全量测试 **197 passed / 0 failed / 1 skipped**
 - Known bugs fixed: `$node->element`→`$node->el`（Node 属性名）；`__a11y_label`→`label`（Ui::accessible prop 名）；sscanf `[^%s]`→手动 tab 分割（空字段）；Canvas mount 必须调用；`$app->start()` 必须调用
+
+## Session 2026-08-01: Win32 UIA 修复 + 富文本 color 测试 + CI test-gtk4 加固
+- **Status:** done
+- **UIA 5-bug 修复（ext/win32.c）**：
+  - Bug #1: `win32_uia_GetPropertyValue` 补 `UIA_ControlTypePropertyId`（返回 `VT_I4` + `UIA_PaneControlTypeId`）
+  - Bug #2: `win32_uia_GetPropertyValue` 补 `UIA_NativeWindowHandlePropertyId`（返回 `VT_I4` + `0`）
+  - Bug #3: vtbl 计数确认正确（4 entries），无需修改
+  - Bug #4: `win32_register_uia` 错误路径 — 已修复（RegisterProviderCallback fail → Release(cb) → cleanup → CoUninitialize）
+  - Bug #5: `ui3_plat_destroy` — 已修复（Release(cb) → Release(registrar) → CoUninitialize）
+- **代码清理**：删除重复 `#include <uiautomation.h>`、未使用 `#include <oleacc.h>`
+- **全文件审查**（win32.c 1245 行）：UIA 生命周期管理、错误路径、a11y tree 实时读取均结构正确
+- **剪贴板修复（ext/win32.c）**：`CF_TEXT`→`CF_UNICODETEXT`（UTF-16），支持非当前代码页字符
+- **RichTextTest.php 增强**：
+  - 新增 `color prop (red #ff0000)` 测试
+  - 新增 `color prop + bold + italic + fontSize` 组合测试
+  - 7/7 全过（5 原有 + 2 新增）
+- **CI test-gtk4 job 加固（.github/workflows/ci.yml）**：
+  - 移除 `continue-on-error: true`（失败阻塞 CI）
+  - 冒烟过滤扩展：`Clipboard|RichText|Compositor|WidgetsParity`
+  - 移除 `2>/dev/null || true`（stderr 可见）
+  - 新增 `UI3_BACKEND=gtk4` + `--no-coverage`
+- Files: `ext/win32.c`, `tests/RichTextTest.php`, `.github/workflows/ci.yml`
+- Verification: RichTextTest 7/7 pass；Win32 无法本地编译（macOS 无 MinGW）

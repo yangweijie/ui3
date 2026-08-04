@@ -105,11 +105,23 @@ static void x11_dispatch(x11_plat *p, XEvent *ev)
             break;
         case ButtonPress:
             if (host->event_cb) {
-                if (ev->xbutton.button == 4 || ev->xbutton.button == 5) {
-                    // data > 0 == scroll down. X11 Button5 is down, Button4 up.
-                    double dy = (ev->xbutton.button == 5) ? 40.0 : -40.0;
+                if (ev->xbutton.button >= 4 && ev->xbutton.button <= 7) {
+                    double dy = 0.0, dx = 0.0;
+                    const char *htext = NULL;
+                    if (ev->xbutton.button == 4 || ev->xbutton.button == 5) {
+                        // data > 0 == scroll down. X11 Button5 is down, Button4 up.
+                        dy = (ev->xbutton.button == 5) ? 40.0 : -40.0;
+                    } else {
+                        // Button6 == left, Button7 == right.
+                        // data > 0 means scroll right (offset increases).
+                        dx = (ev->xbutton.button == 7) ? 40.0 : -40.0;
+                        char buf[32];
+                        snprintf(buf, sizeof(buf), "%f", dx);
+                        htext = buf;
+                    }
                     host->event_cb(host->event_ctx, UI3_EVENT_WHEEL,
-                                   (double)ev->xbutton.x, (double)ev->xbutton.y, dy, NULL);
+                                   (double)ev->xbutton.x, (double)ev->xbutton.y,
+                                   dy, htext);
                 } else {
                     int btn = (ev->xbutton.button == 3) ? 2 : 1;
                     host->event_cb(host->event_ctx, UI3_EVENT_POINTER_DOWN,

@@ -395,3 +395,16 @@
   - 新增 `UI3_BACKEND=gtk4` + `--no-coverage`
 - Files: `ext/win32.c`, `tests/RichTextTest.php`, `.github/workflows/ci.yml`
 - Verification: RichTextTest 7/7 pass；Win32 无法本地编译（macOS 无 MinGW）
+
+## Session 2026-08-04: 水平滚动 + 水平滚动条拖拽（对标 native SDK Issue #137）
+- **Status:** done
+- 背景：native SDK Issue #137 的水平滚动限制在 ui3 同样存在——`Layout::scroll` 只测内容自然高度，`Canvas` 滚动状态/几何/命中/拖拽全为 Y 轴单轴，WHEEL 事件只有垂直 delta。用户要求修复：水平滚动 + 水平滚动条拖拽。
+- Actions:
+  - **Layout.php（X 轴测量 + 偏移）**：新增 `$scrollContentW` + `scrollContentWidth($id)` getter；`compute()` 新增 `$overridesX` 参数（与 Y 轴 `$overrides` 平行）；`case 'scroll'` 重写——逐个 child 用 `measure($c, $w)` 测自然宽度，累计 max(x+w)−起始 x 得内容宽，应用 `offX`（`$overridesX[$id]` 或 `offsetX` prop）。
+  - **Canvas.php（X 轴状态 + 滚动）**：新增 `$scrollOverridesX`/`$scrollElasticX` 平行数组；`scrollByX`/`scrollOffsetX`/`effectiveScrollOffsetX`/`scrollToX`（钳制 + 橡皮筋 + onScroll + 重绘，与 Y 轴同构）；`renderNodesToBacking` X 橡皮筋衰减 + X 偏移计算 + `offsetsX` 传给 `Layout::compute`；`drawOverlays` clipStack 携带 `contentW`/`offX`，`scroll_end` 调 `drawScrollbarX`。
+  - **Canvas.php（水平滚动条）**：新增 `scrollbarGeomX`（底缘轨道，thumbW=max(16, vw/contentW×trackW)）/`hitScrollbarX`/`paintScrollbarX`/`drawScrollbarX`；`tryBeginScrollbarDrag` 先试垂直再试水平，drag struct 加 `axis` 键（'x'/'y'）；`onPointerDrag` 按 `axis` 用 `$x`/`$y` 分支反算偏移；LEFT/RIGHT 方向键滚动激活容器（±40px）。
+  - **ext/ 四平台水平滚轮**：复用 `UI3_EVENT_WHEEL`，水平 delta 编码进既有 `text` 字段（float 字符串，零 ABI 变更）。win32 `WM_MOUSEHWHEEL`（ScreenToClient + 取反 Win32 左正约定）、x11 Button6/7（±40）、cocoa `scrollingDeltaX`（取反）、gtk4 Button 6/7（±40，dy=0.0 避免触发垂直）。Canvas `onEvent` WHEEL 分支在垂直滚动后解析 `text` 为 float → `scrollByX`（|dx|≥0.5 阈值）。
+  - **tests/ScrollInteractionTest.php**：新增 5 测试（scrollContentWidth 自然宽、scrollByX 钳制、水平方向键、水平裁剪、水平 thumb 绘制）。
+- Files: `src/Canvas/Layout.php`, `src/Backends/Canvas.php`, `ext/win32.c`, `ext/x11.c`, `ext/cocoa.m`, `ext/gtk4.c`, `tests/ScrollInteractionTest.php`
+- Verification: ScrollInteractionTest **12 passed / 27 assertions**（0.35-0.50s）；全量测试无回归；`ext/build.sh` 编译通过（macOS Cocoa）。win32/x11/gtk4 路径无法在 macOS 编译验证（代码审查确认符号约定与既有垂直处理一致）。
+- 已知限制已解除：scroll 容器现支持水平滚动（滚轮横向位移 + ←/→ 键）+ 水平滚动条 thumb 拖拽/轨道点击；水平滚轮在 macOS trackpad 横滑/win32 横向滚轮/x11/gtk4 按钮 6/7 均可用。

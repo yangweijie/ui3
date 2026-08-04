@@ -58,8 +58,12 @@ final class Canvas implements Backend
     private array $animStates = [];
     /** Per-id scroll offset overrides (programmatic wheel/scroll). int by id. */
     private array $scrollOverrides = [];
+    /** Per-id horizontal scroll offset overrides. int by id. */
+    private array $scrollOverridesX = [];
     /** Rubber-band elastic overshoot in px, keyed by id; decays to 0 each frame. */
     private array $scrollElastic = [];
+    /** Horizontal rubber-band elastic overshoot in px, keyed by id. */
+    private array $scrollElasticX = [];
     /** Clock time until which scrollbars stay fully visible (native overlay behaviour). */
     private float $scrollbarVisibleUntil = 0.0;
     /** Open context menus keyed by element id => item list. */
@@ -295,6 +299,71 @@ final class Canvas implements Backend
         // A list's `scroll` prop is an item index; convert to pixels to match
         // the scroll-container model (px) used everywhere else.
         return $node->type === 'list' ? $raw * Layout::LISTITEM : $raw;
+    }
+
+    /** Programmatically scroll a list/scroll widget horizontally by $delta pixels. */
+    public function scrollByX(string $id, int $delta): void
+    {
+        if ($this->layout === [] && $this->root) {
+            $this->layout = Layout::compute($this->root);
+        }
+        $node = $this->findNodeById($id);
+        if ($node === null) {
+            return;
+        }
+        $sid = (string) $node->el->prop('id');
+        $cur = $this->scrollOffsetX($id);
+        $maxOff = max(0, Layout::scrollContentWidth($sid) - (int) $node->w);
+        $target = $cur + $delta;
+        if ($target < 0) {
+            $this->scrollOverridesX[$id] = 0;
+            $this->scrollElasticX[$id] = $target;
+        } elseif ($target > $maxOff) {
+            $this->scrollOverridesX[$id] = $maxOff;
+            $this->scrollElasticX[$id] = $target - $maxOff;
+        } else {
+            $this->scrollOverridesX[$id] = $target;
+        }
+        $this->scrollbarVisibleUntil = $this->now() + self::SCROLLBAR_IDLE;
+        $this->requestRedraw();
+    }
+
+    /** Current horizontal scroll offset for a scroll widget (pixels). */
+    public function scrollOffsetX(string $id): int
+    {
+        if (isset($this->scrollOverridesX[$id])) {
+            return (int) $this->scrollOverridesX[$id];
+        }
+        $node = $this->findNodeById($id);
+        if ($node === null) {
+            return 0;
+        }
+        return (int) $node->el->prop('offsetX', 0);
+    }
+
+    /** Rendered horizontal offset = clamped target + damped rubber-band overshoot. */
+    private function effectiveScrollOffsetX(string $id): int
+    {
+        $off = $this->scrollOffsetX($id);
+        $e = $this->scrollElasticX[$id] ?? 0.0;
+        return (int) round($off + $e * self::SCROLL_ELASTIC_DAMP);
+    }
+
+    /** Absolute horizontal scroll (clamped, no rubber-band) + redraw. */
+    private function scrollToX(string $id, int $off): void
+    {
+        $node = $this->findNodeById($id);
+        if ($node === null) {
+            return;
+        }
+        $sid = (string) $node->el->prop('id');
+        $contentW = Layout::scrollContentWidth($sid);
+        $maxOff = max(0, $contentW - (int) $node->w);
+        $target = max(0, min($maxOff, $off));
+        $this->scrollOverridesX[$id] = $target;
+        unset($this->scrollElasticX[$id]);
+        $this->scrollbarVisibleUntil = $this->now() + self::SCROLLBAR_IDLE;
+        $this->requestRedraw();
     }
 
     /**
@@ -1930,7 +1999,7 @@ final class Canvas implements Backend
      */
     private function renderNodesToBacking($cr): void
     {
-        // Rubber-band decay
+        // Rubber-band decay (Y)
         foreach ($this->scrollElastic as $eid => $e) {
             $e2 = $e * 0.82;
             if (abs($e2) < 0.5) {
@@ -1939,12 +2008,26 @@ final class Canvas implements Backend
                 $this->scrollElastic[$eid] = $e2;
             }
         }
+        // Rubber-band decay (X)
+        foreach ($this->scrollElasticX as $eid => $e) {
+            $e2 = $e * 0.82;
+            if (abs($e2) < 0.5) {
+                unset($this->scrollElasticX[$eid]);
+            } else {
+                $this->scrollElasticX[$eid] = $e2;
+            }
+        }
         $offsets = [];
         foreach ($this->scrollOverrides as $eid => $off) {
             $e = $this->scrollElastic[$eid] ?? 0.0;
             $offsets[$eid] = (int) round($off + $e * self::SCROLL_ELASTIC_DAMP);
         }
-        $this->layout = Layout::compute($this->root, $offsets);
+        $offsetsX = [];
+        foreach ($this->scrollOverridesX as $eid => $off) {
+            $e = $this->scrollElasticX[$eid] ?? 0.0;
+            $offsetsX[$eid] = (int) round($off + $e * self::SCROLL_ELASTIC_DAMP);
+        }
+        $this->layout = Layout::compute($this->root, $offsets, $offsetsX);
 
         // Clip stack driven by sequential iteration (same as the original
         // paint() loop, but without inline scrollbar drawing).
@@ -1984,6 +2067,7 @@ final class Canvas implements Backend
                 $sc = array_pop($clipStack);
                 if ($sc !== null) {
                     $this->drawScrollbar($cr, $sc);
+                    $this->drawScrollbarX($cr, $sc);
                 }
                 continue;
             }
@@ -1991,10 +2075,12 @@ final class Canvas implements Backend
                 $id = $n->el->prop('id');
                 $sid = $id !== null ? (string) $id : '';
                 $clipStack[] = [
-                    'rect'     => [$n->x, $n->y, $n->w, $n->h],
-                    'node'     => $n,
-                    'contentH' => $sid !== '' ? Layout::scrollContentHeight($sid) : $n->h,
-                    'off'      => $sid !== '' ? $this->effectiveScrollOffset($sid) : 0,
+                    'rect'      => [$n->x, $n->y, $n->w, $n->h],
+                    'node'      => $n,
+                    'contentH'  => $sid !== '' ? Layout::scrollContentHeight($sid) : $n->h,
+                    'contentW'  => $sid !== '' ? Layout::scrollContentWidth($sid) : $n->w,
+                    'off'       => $sid !== '' ? $this->effectiveScrollOffset($sid) : 0,
+                    'offX'      => $sid !== '' ? $this->effectiveScrollOffsetX($sid) : 0,
                 ];
             }
         }
@@ -2031,6 +2117,14 @@ final class Canvas implements Backend
             $id = $this->scrollContainerAt($x, $y);
             if ($id !== null) {
                 $this->scrollBy($id, (int) $data);
+                // Horizontal delta may be encoded in $text as a float string
+                // when a horizontal scroll wheel / touchpad pan occurs.
+                if ($text !== null && $text !== '') {
+                    $dx = (float) $text;
+                    if (abs($dx) >= 0.5) {
+                        $this->scrollByX($id, (int) $dx);
+                    }
+                }
             }
             return;
         }
@@ -2194,6 +2288,11 @@ final class Canvas implements Backend
         // Arrow Up/Down scroll the active scroll container (set on pointer-down).
         if (($text === self::KEY_UP || $text === self::KEY_DOWN) && $this->activeScrollId !== null) {
             $this->scrollBy($this->activeScrollId, $text === self::KEY_DOWN ? 40 : -40);
+            return;
+        }
+        // Arrow Left/Right scroll horizontally in the active scroll container.
+        if (($text === self::KEY_LEFT || $text === self::KEY_RIGHT) && $this->activeScrollId !== null) {
+            $this->scrollByX($this->activeScrollId, $text === self::KEY_RIGHT ? 40 : -40);
             return;
         }
         // Escape closes any open context menu first, then expanded dropdowns.
@@ -2803,6 +2902,78 @@ private function spellErrors(string $id, string $text): array
         return null;
     }
 
+    /**
+     * Horizontal scrollbar geometry. Returns null when content width fits.
+     * Mirrors scrollbarGeom() but rotated 90 degrees.
+     */
+    private function scrollbarGeomX(Node $node, int $contentW, int $offX): ?array
+    {
+        $vw = $node->w;
+        if ($contentW <= $vw) {
+            return null;
+        }
+        $thickness = (int) ($this->theme['scrollbarThickness'] ?? 8);
+        $trackX = $node->x + 2;
+        $trackY = $node->y + $node->h - $thickness - 2;
+        $trackW = $vw - 4;
+        $maxOff = $contentW - $vw;
+        $thumbW = max(16, (int) (($vw / $contentW) * $trackW));
+        $thumbX = $trackX + (int) ((($trackW - $thumbW) * $offX) / $maxOff);
+        return [
+            'thickness' => $thickness,
+            'trackX'    => $trackX,
+            'trackY'    => $trackY,
+            'trackW'    => $trackW,
+            'thumbW'    => $thumbW,
+            'thumbX'    => $thumbX,
+            'maxOff'    => $maxOff,
+            'vw'        => $vw,
+            'contentW'  => $contentW,
+        ];
+    }
+
+    /**
+     * Hit-test a horizontal scrollbar. Returns 'thumb', 'track', or null.
+     */
+    private function hitScrollbarX(float $x, float $y, array $g): ?string
+    {
+        if ($y >= $g['trackY'] - 2 && $y <= $g['trackY'] + $g['thickness'] + 2
+            && $x >= $g['trackX'] && $x <= $g['trackX'] + $g['trackW']) {
+            if ($x >= $g['thumbX'] && $x <= $g['thumbX'] + $g['thumbW']) {
+                return 'thumb';
+            }
+            return 'track';
+        }
+        return null;
+    }
+
+    /** Paint a horizontal overlay scrollbar (faint track + accent thumb). */
+    private function paintScrollbarX($cr, Node $node, int $contentW, int $offX): void
+    {
+        $g = $this->scrollbarGeomX($node, $contentW, $offX);
+        if ($g === null) {
+            return;
+        }
+        $remaining = $this->scrollbarVisibleUntil - $this->clock;
+        $alpha = $remaining > 0
+            ? 1.0
+            : max(0.0, min(1.0, ($remaining + self::SCROLLBAR_FADE) / self::SCROLLBAR_FADE));
+        if ($alpha <= 0.01) {
+            return;
+        }
+        $radius = (float) ($this->theme['scrollbarRadius'] ?? 3);
+        [$tr, $tg, $tb] = $this->col('scrollbarTrack');
+        [$hr, $hg, $hb] = $this->col('scrollbarThumb');
+        Cairo::fillRoundedRect($cr, $g['trackX'], $g['trackY'], $g['trackW'], $g['thickness'], $radius, $tr, $tg, $tb, 0.45 * $alpha);
+        Cairo::fillRoundedRect($cr, $g['thumbX'], $g['trackY'], $g['thumbW'], $g['thickness'], $radius, $hr, $hg, $hb, 0.9 * $alpha);
+    }
+
+    /** Draw horizontal scrollbar for a scroll container. */
+    private function drawScrollbarX($cr, array $sc): void
+    {
+        $this->paintScrollbarX($cr, $sc['node'], (int) $sc['contentW'], (int) $sc['offX']);
+    }
+
     /** Absolute scroll (clamped, no rubber-band) + onScroll + redraw. */
     private function scrollTo(string $id, int $off): void
     {
@@ -2826,8 +2997,8 @@ private function spellErrors(string $id, string $text): array
 
     /**
      * Begin a scrollbar drag if the pointer lands on a scroll container's bar.
-     * Returns true (and arms $this->drag) when it consumes the press, so the
-     * caller skips the normal content hit-test / fire.
+     * Tries vertical first, then horizontal. Returns true (and arms $this->drag)
+     * when it consumes the press, so the caller skips the normal content hit-test.
      */
     private function tryBeginScrollbarDrag(float $x, float $y): bool
     {
@@ -2839,42 +3010,78 @@ private function spellErrors(string $id, string $text): array
         if ($node === null) {
             return false;
         }
+
+        // Try vertical scrollbar first.
         $contentH = Layout::scrollContentHeight($sid);
         $g = $this->scrollbarGeom($node, $contentH, $this->effectiveScrollOffset($sid));
-        if ($g === null) {
-            return false;
-        }
-        $hit = $this->hitScrollbar($x, $y, $g);
-        if ($hit === null) {
-            return false;
-        }
-        if ($hit === 'track') {
-            // Click on the track: jump so the click lands mid-thumb, then start
-            // dragging from there (matches native track-click behaviour).
-            $jump = (int) ((($y - $g['trackY']) * $g['maxOff']) / max(1, $g['trackH'] - $g['thumbH']));
-            $this->scrollTo($sid, $jump - (int) ($g['thumbH'] / 2));
-            $g = $this->scrollbarGeom($node, $contentH, $this->effectiveScrollOffset($sid));
-            if ($g === null) {
-                $this->drag = ['type' => 'scrollbar', 'id' => $sid, 'grab' => 0, 'trackY' => 0, 'trackH' => 1, 'thumbH' => 1, 'maxOff' => 1];
+        if ($g !== null) {
+            $hit = $this->hitScrollbar($x, $y, $g);
+            if ($hit !== null) {
+                if ($hit === 'track') {
+                    $jump = (int) ((($y - $g['trackY']) * $g['maxOff']) / max(1, $g['trackH'] - $g['thumbH']));
+                    $this->scrollTo($sid, $jump - (int) ($g['thumbH'] / 2));
+                    $g = $this->scrollbarGeom($node, $contentH, $this->effectiveScrollOffset($sid));
+                    if ($g === null) {
+                        $this->drag = ['type' => 'scrollbar', 'id' => $sid, 'grab' => 0, 'trackY' => 0, 'trackH' => 1, 'thumbH' => 1, 'maxOff' => 1, 'axis' => 'y'];
+                        $this->requestRedraw();
+                        return true;
+                    }
+                    $grab = $g['thumbH'] / 2;
+                } else {
+                    $grab = $y - $g['thumbY'];
+                }
+                $this->drag = [
+                    'type'    => 'scrollbar',
+                    'id'      => $sid,
+                    'grab'    => $grab,
+                    'trackY'  => $g['trackY'],
+                    'trackH'  => $g['trackH'],
+                    'thumbH'  => $g['thumbH'],
+                    'maxOff'  => $g['maxOff'],
+                    'axis'    => 'y',
+                ];
+                $this->scrollbarVisibleUntil = $this->now() + self::SCROLLBAR_IDLE;
                 $this->requestRedraw();
                 return true;
             }
-            $grab = $g['thumbH'] / 2;
-        } else {
-            $grab = $y - $g['thumbY'];
         }
-        $this->drag = [
-            'type'    => 'scrollbar',
-            'id'      => $sid,
-            'grab'    => $grab,
-            'trackY'  => $g['trackY'],
-            'trackH'  => $g['trackH'],
-            'thumbH'  => $g['thumbH'],
-            'maxOff'  => $g['maxOff'],
-        ];
-        $this->scrollbarVisibleUntil = $this->now() + self::SCROLLBAR_IDLE;
-        $this->requestRedraw();
-        return true;
+
+        // Try horizontal scrollbar.
+        $contentW = Layout::scrollContentWidth($sid);
+        $gX = $this->scrollbarGeomX($node, $contentW, $this->effectiveScrollOffsetX($sid));
+        if ($gX !== null) {
+            $hit = $this->hitScrollbarX($x, $y, $gX);
+            if ($hit !== null) {
+                if ($hit === 'track') {
+                    $jump = (int) ((($x - $gX['trackX']) * $gX['maxOff']) / max(1, $gX['trackW'] - $gX['thumbW']));
+                    $this->scrollToX($sid, $jump - (int) ($gX['thumbW'] / 2));
+                    $gX = $this->scrollbarGeomX($node, $contentW, $this->effectiveScrollOffsetX($sid));
+                    if ($gX === null) {
+                        $this->drag = ['type' => 'scrollbar', 'id' => $sid, 'grab' => 0, 'trackX' => 0, 'trackW' => 1, 'thumbW' => 1, 'maxOff' => 1, 'axis' => 'x'];
+                        $this->requestRedraw();
+                        return true;
+                    }
+                    $grab = $gX['thumbW'] / 2;
+                } else {
+                    $grab = $x - $gX['thumbX'];
+                }
+                $this->drag = [
+                    'type'    => 'scrollbar',
+                    'id'      => $sid,
+                    'grab'    => $grab,
+                    'trackX'  => $gX['trackX'],
+                    'trackW'  => $gX['trackW'],
+                    'thumbW'  => $gX['thumbW'],
+                    'maxOff'  => $gX['maxOff'],
+                    'axis'    => 'x',
+                ];
+                $this->scrollbarVisibleUntil = $this->now() + self::SCROLLBAR_IDLE;
+                $this->requestRedraw();
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -3411,9 +3618,16 @@ private function spellErrors(string $id, string $text): array
         if ($d['type'] === 'scrollbar') {
             $node = $this->findNodeById($d['id']);
             if ($node !== null) {
-                $raw = $y - $d['grab'] - $d['trackY'];
-                $off = (int) (($raw * $d['maxOff']) / max(1, $d['trackH'] - $d['thumbH']));
-                $this->scrollTo($d['id'], $off);
+                $axis = $d['axis'] ?? 'y';
+                if ($axis === 'x') {
+                    $raw = $x - $d['grab'] - $d['trackX'];
+                    $off = (int) (($raw * $d['maxOff']) / max(1, $d['trackW'] - $d['thumbW']));
+                    $this->scrollToX($d['id'], $off);
+                } else {
+                    $raw = $y - $d['grab'] - $d['trackY'];
+                    $off = (int) (($raw * $d['maxOff']) / max(1, $d['trackH'] - $d['thumbH']));
+                    $this->scrollTo($d['id'], $off);
+                }
             }
             return;
         }

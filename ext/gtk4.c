@@ -147,7 +147,21 @@ gtk4_on_click(GtkGestureClick *gl, int n_press, double x, double y, void *pvoid)
 
     if (button >= 4) {
         double dy = (button == 5) ? 40.0 : -40.0;
-        host->event_cb(host->event_ctx, UI3_EVENT_WHEEL, x, y, dy, NULL);
+        const char *htext = NULL;
+        /* Buttons 6/7: horizontal scroll wheel on some mice.
+         * Button6 == left, Button7 == right (data>0 = scroll right). */
+        if (button == 7) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "40.0");
+            htext = buf;
+            dy = 0.0;
+        } else if (button == 6) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "-40.0");
+            htext = buf;
+            dy = 0.0;
+        }
+        host->event_cb(host->event_ctx, UI3_EVENT_WHEEL, x, y, dy, htext);
         return;
     }
 

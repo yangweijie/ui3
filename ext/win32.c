@@ -193,6 +193,20 @@ static LRESULT CALLBACK win32_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             }
             return 0;
         }
+        case WM_MOUSEHWHEEL: {
+            if (host->event_cb) {
+                POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+                ScreenToClient(hwnd, &pt);
+                // Win32 reports left as positive, but PHP data>0 means "scroll right"
+                // (offset increases). Negate to match the WHEEL convention.
+                double dx = -(double)GET_WHEEL_DELTA_WPARAM(wParam) / (double)WHEEL_DELTA * 40.0;
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%f", dx);
+                host->event_cb(host->event_ctx, UI3_EVENT_WHEEL,
+                               (double)pt.x, (double)pt.y, 0.0, buf);
+            }
+            return 0;
+        }
         case WM_MOUSEMOVE:
             if (host->event_cb)
                 host->event_cb(host->event_ctx, UI3_EVENT_POINTER_MOVE,

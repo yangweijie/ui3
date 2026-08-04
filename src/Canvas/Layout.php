@@ -36,6 +36,8 @@ final class Layout
     private static $textWidthFn = null;
     /** Per-id content (natural) height of scroll containers, filled during compute(). */
     private static array $scrollContent = [];
+    /** Per-id content (natural) width of scroll containers, filled during compute(). */
+    private static array $scrollContentW = [];
 
     public static function setTextWidth(?callable $fn): void
     {
@@ -58,11 +60,15 @@ final class Layout
     /** @return list<Node> */
     /** Per-id scroll offset overrides injected by the backend (programmatic scroll). */
     private static array $overrides = [];
+    /** Per-id horizontal scroll offset overrides (programmatic horizontal scroll). */
+    private static array $overridesX = [];
 
-    public static function compute(Element $root, array $overrides = []): array
+    public static function compute(Element $root, array $overrides = [], array $overridesX = []): array
     {
         self::$overrides = $overrides;
+        self::$overridesX = $overridesX;
         self::$scrollContent = [];
+        self::$scrollContentW = [];
         $nodes = [];
         $w = (int) $root->prop('width', 320);
         $h = (int) $root->prop('height', 240);
@@ -112,6 +118,12 @@ final class Layout
     public static function scrollContentHeight(string $id): int
     {
         return self::$scrollContent[$id] ?? 0;
+    }
+
+    /** Natural content width of a scroll container, or 0 if unknown. */
+    public static function scrollContentWidth(string $id): int
+    {
+        return self::$scrollContentW[$id] ?? 0;
     }
 
     /**
@@ -303,11 +315,41 @@ final class Layout
                 $nodes[] = new Node($el, 'scroll', $x, $y, $w, $h);
                 $id = $el->prop('id');
                 $off = (int)($id !== null && isset(self::$overrides[$id]) ? self::$overrides[$id] : $el->prop('offset', 0));
-                // placeColumn returns the natural content height; capture it so the
-                // painter can size the scrollbar thumb.
-                $contentH = self::placeColumn($el->children, $x, $y - $off, $w, $nodes);
+                $offX = 0;
                 if ($id !== null) {
-                    self::$scrollContent[(string) $id] = $contentH;
+                    $oX = self::$overridesX[$id] ?? null;
+                    if ($oX !== null) {
+                        $offX = (int) $oX;
+                    } else {
+                        $offX = (int) $el->prop('offsetX', 0);
+                    }
+                }
+                // Measure each child at its natural width (not forced to $w) so that
+                // horizontal scrolling works — children may collectively exceed $w.
+                $cx = $x - $offX;
+                $totalW = 0;
+                $totalH = 0;
+                $cy = $y - $off;
+                $childrenNodes = [];
+                foreach ($el->children as $c) {
+                    [$rw, $rh] = self::measure($c, $w);
+                    self::place($c, $cx, $cy, $rw, $childrenNodes, $rh);
+                    $cx += $rw + self::PAD;
+                    $totalW = max($totalW, $cx - $x - self::PAD);
+                    $cy += $rh + self::PAD;
+                    $totalH = max($totalH, $cy - $y - self::PAD);
+                }
+                // Remove trailing padding from the last child.
+                if ($totalW > 0) {
+                    $totalW -= self::PAD;
+                }
+                if ($totalH > 0) {
+                    $totalH -= self::PAD;
+                }
+                $nodes = array_merge($nodes, $childrenNodes);
+                if ($id !== null) {
+                    self::$scrollContent[(string) $id] = (int) $totalH;
+                    self::$scrollContentW[(string) $id] = (int) $totalW;
                 }
                 // Sentinel marking the end of this scroll container's content so
                 // the Canvas painter can pop the clip region it pushed for it.

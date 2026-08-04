@@ -287,3 +287,158 @@ test('clicking the scrollbar track jumps the thumb there', function (): void {
     $expected = max(0, min($maxOff, $jump - (int) ($thumbH / 2)));
     expect($backend->scrollOffset('list'))->toBe($expected);
 });
+
+// ---- Horizontal scroll tests ----
+
+test('scrollContentWidth reports natural content width', function (): void {
+    $root = new Element('window', ['width' => 320, 'height' => 240], [
+        new Element('scroll', ['id' => 'wide'], [
+            new Element('label', ['text' => 'verylonglabelthatshouldbeyondthelimits']),
+            new Element('label', ['text' => 'anotherlongonethatspanswidely']),
+        ]),
+    ]);
+    Layout::compute($root);
+    $w = Layout::scrollContentWidth('wide');
+    expect($w)->toBeGreaterThan(320); // content wider than viewport
+});
+
+test('scrollByX moves horizontal offset and clamps at bounds', function (): void {
+    $root = new Element('window', ['width' => 320, 'height' => 240], [
+        new Element('scroll', ['id' => 'wide', 'grow' => 1], [
+            new Element('label', ['text' => 'verylonglabelthatshouldbeyondthelimits']),
+            new Element('label', ['text' => 'anotherlongonethatspanswidely']),
+        ]),
+    ]);
+
+    $backend = new Canvas(headless: true);
+    $backend->mount($root, fn(): null => null);
+
+    $scroll = null;
+    foreach (Layout::compute($root) as $n) {
+        if ($n->type === 'scroll' && $n->el->prop('id') === 'wide') {
+            $scroll = $n;
+            break;
+        }
+    }
+    expect($scroll)->not->toBeNull();
+
+    $maxOff = max(0, Layout::scrollContentWidth('wide') - (int) $scroll->w);
+
+    // Scroll right
+    $backend->scrollByX('wide', 40);
+    expect($backend->scrollOffsetX('wide'))->toBe(40);
+
+    // Scroll left back
+    $backend->scrollByX('wide', -40);
+    expect($backend->scrollOffsetX('wide'))->toBe(0);
+
+    // Clamp at bottom
+    $backend->scrollByX('wide', $maxOff + 500);
+    expect($backend->scrollOffsetX('wide'))->toBe($maxOff);
+});
+
+test('horizontal arrow keys scroll the activated scroll container', function (): void {
+    $root = new Element('window', ['width' => 320, 'height' => 240], [
+        new Element('scroll', ['id' => 'wide', 'grow' => 1], [
+            new Element('label', ['text' => 'verylonglabelthatshouldbeyondthelimits']),
+            new Element('label', ['text' => 'anotherlongonethatspanswidely']),
+        ]),
+    ]);
+
+    $backend = new Canvas(headless: true);
+    $backend->mount($root, fn(): null => null);
+
+    $scroll = null;
+    foreach (Layout::compute($root) as $n) {
+        if ($n->type === 'scroll' && $n->el->prop('id') === 'wide') {
+            $scroll = $n;
+            break;
+        }
+    }
+    expect($scroll)->not->toBeNull();
+
+    // Activate by pointer-down inside viewport
+    $backend->injectPointer($scroll->x + 5, $scroll->y + 10, true);
+    $backend->step();
+    expect($backend->scrollOffsetX('wide'))->toBe(0);
+
+    // Arrow Right scrolls horizontally
+    $backend->injectKey("\x02"); // KEY_RIGHT
+    $backend->step();
+    expect($backend->scrollOffsetX('wide'))->toBe(40);
+
+    // Arrow Left scrolls back
+    $backend->injectKey("\x01"); // KEY_LEFT
+    $backend->step();
+    expect($backend->scrollOffsetX('wide'))->toBe(0);
+});
+
+test('horizontal scroll keeps overflow clipped to the viewport', function (): void {
+    $root = new Element('window', ['width' => 320, 'height' => 240], [
+        new Element('scroll', ['id' => 'wide', 'grow' => 1], [
+            new Element('label', ['text' => 'verylonglabelthatshouldbeyondthelimits']),
+            new Element('label', ['text' => 'anotherlongonethatspanswidely']),
+        ]),
+    ]);
+
+    $backend = new Canvas(headless: true);
+    $backend->mount($root, fn(): null => null);
+
+    $scroll = null;
+    foreach (Layout::compute($root) as $n) {
+        if ($n->type === 'scroll' && $n->el->prop('id') === 'wide') {
+            $scroll = $n;
+            break;
+        }
+    }
+
+    $bg = $backend->offscreenPixels()['px'][2][2];
+    // Region far right of viewport must stay background (clipped).
+    $rightX = (int) ($scroll->x + $scroll->w + 4);
+    $buf = $backend->offscreenPixels();
+    expect($buf['px'][2][$rightX])->toBe($bg);
+
+    // Scroll right: content moves but overflow still clipped.
+    $backend->scrollByX('wide', 100);
+    $buf2 = $backend->offscreenPixels();
+    expect($buf2['px'][2][$rightX])->toBe($bg);
+});
+
+test('overflowing horizontal scroll container paints a horizontal scrollbar thumb', function (): void {
+    $root = new Element('window', ['width' => 320, 'height' => 240], [
+        new Element('scroll', ['id' => 'wide', 'grow' => 1], [
+            new Element('label', ['text' => 'verylonglabelthatshouldbeyondthelimits']),
+            new Element('label', ['text' => 'anotherlongonethatspanswidely']),
+        ]),
+    ]);
+
+    $backend = new Canvas(headless: true);
+    $backend->mount($root, fn(): null => null);
+
+    $scroll = null;
+    foreach (Layout::compute($root) as $n) {
+        if ($n->type === 'scroll' && $n->el->prop('id') === 'wide') {
+            $scroll = $n;
+            break;
+        }
+    }
+
+    // Trigger scrollbar visibility
+    $backend->scrollByX('wide', 0);
+    $buf = $backend->offscreenPixels();
+    $px = $buf['px'];
+    $thumb = $backend->col('scrollbarThumb');
+    [$tr, $tg, $tb] = array_map(static fn(float $c): int => (int) ($c * 255), $thumb);
+
+    // Horizontal scrollbar track/thumb sits at the bottom edge of the viewport.
+    $ty = (int) ($scroll->y + $scroll->h - 8);
+    $found = false;
+    for ($x = (int) $scroll->x; $x < (int) ($scroll->x + $scroll->w); $x++) {
+        $p = $px[$ty][$x];
+        if (abs($p[0] - $tr) < 24 && abs($p[1] - $tg) < 24 && abs($p[2] - $tb) < 24) {
+            $found = true;
+            break;
+        }
+    }
+    expect($found)->toBeTrue();
+});

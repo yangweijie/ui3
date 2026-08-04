@@ -115,7 +115,17 @@ static void cocoa_paint(ui3_host *host, CGContextRef cg)
     NSPoint p = [self convertPoint:[e locationInWindow] fromView:nil];
     // data > 0 == scroll down (viewport offset increases). Cocoa reports a
     // downward physical scroll as a negative deltaY, so negate.
-    host->event_cb(host->event_ctx, UI3_EVENT_WHEEL, p.x, p.y, -[e scrollingDeltaY], NULL);
+    double dy = -[e scrollingDeltaY];
+    // Cocoa also reports horizontal scrolling via scrollingDeltaX.
+    // Send horizontal delta via the text field (PHP-side convention).
+    double dx = -[e scrollingDeltaX];
+    const char *htext = NULL;
+    if (fabs(dx) > 0.01) {
+        static char buf[32];
+        snprintf(buf, sizeof(buf), "%f", dx);
+        htext = buf;
+    }
+    host->event_cb(host->event_ctx, UI3_EVENT_WHEEL, p.x, p.y, dy, htext);
 
     /* Pan momentum (P-Native P1): when a trackpad two-finger pan gesture is
      * active (phase != None), also deliver a GESTURE event with gtype=3 (pan).
